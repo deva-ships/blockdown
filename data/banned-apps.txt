@@ -1,0 +1,39 @@
+# Blockdown — Layer 2 app-name template (sample, NOT auto-loaded)
+#
+# One app display name per line (no .app suffix). Lines starting with "#" and
+# blank lines are ignored by the seed loop in layers/02-app-blocking.md. This is
+# the path-match list for the kill daemon.
+#
+# A fresh install starts with an EMPTY live list. This template is Tier 1/2
+# browsers (categories 1–4) that bypass Blockdown's layers: built-in VPN/Tor,
+# or Firefox-family browsers unmanageable by Layer 4. Add your own targets by
+# appending display names.
+
+# ── Opera (built-in VPN) ──────────────────────────────────────────────────────
+Opera
+Opera Beta
+Opera Developer
+Opera GX
+Opera Crypto Browser
+Opera One
+Opera Air
+
+# ── Brave (built-in Tor) ──────────────────────────────────────────────────────
+Brave
+Brave Beta
+Brave Nightly
+Brave Dev
+
+# ── Other VPN / Tor browsers ──────────────────────────────────────────────────
+Tor Browser
+Mullvad Browser
+Epic Privacy Browser
+
+# ── Firefox forks (unmanageable by Layer 4) ───────────────────────────────────
+Firefox
+Firefox Developer Edition
+Firefox Nightly
+LibreWolf
+Waterfox
+Floorp
+Zen Browser

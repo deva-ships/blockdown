@@ -1,0 +1,28 @@
+# Blockdown — Layer 1 hosts template (sample, NOT auto-loaded)
+#
+# One bare domain per line (e.g. example.com). Lines starting with "#" and blank
+# lines are ignored by the seed loop in layers/01-hosts-file.md. The CLI adds the
+# www. variant automatically, so do NOT list both example.com and www.example.com.
+#
+# A fresh install starts with an EMPTY live list. This template is web-based
+# proxy / "unblock site" services. Populate with `sudo blockdown host add
+# <domain>`, or seed from this file per the layer doc.
+
+croxyproxy.com
+croxyproxy.rocks
+croxyproxy.net
+proxysite.com
+proxyium.com
+proxyscrape.com
+hide.me
+hidester.com
+kproxy.com
+4everproxy.com
+4everproxy.net
+yuyuproxy.com
+blockaway.net
+proxyorb.com
+proxykuy.com
+proxypal.net
+www-proxy.hidester.one
+proxygratis.id

@@ -1,0 +1,40 @@
+# Blockdown — Layer 2 bundle-ID template (sample, NOT auto-loaded)
+#
+# One CFBundleIdentifier per line. Lines starting with "#" and blank lines are
+# ignored by the seed loop in layers/02-app-blocking.md. This is the secondary
+# "kill by bundle ID" list that catches manual renames of a blocked app.
+#
+# A fresh install starts with an EMPTY live list. This template is Tier 1/2
+# browsers (categories 1–4) that bypass Blockdown's layers: built-in VPN/Tor,
+# or Firefox-family browsers unmanageable by Layer 4. Add your own targets by
+# appending bundle IDs (find one with:
+#   defaults read "/Applications/<App>.app/Contents/Info" CFBundleIdentifier).
+
+# ── Opera (built-in VPN) ──────────────────────────────────────────────────────
+com.operasoftware.Opera
+com.operasoftware.OperaNext
+com.operasoftware.OperaDeveloper
+com.operasoftware.OperaGX
+com.operasoftware.OperaCrypto
+com.operasoftware.OperaOne
+com.operasoftware.OperaAir
+
+# ── Brave (built-in Tor) ──────────────────────────────────────────────────────
+com.brave.Browser
+com.brave.Browser.beta
+com.brave.Browser.nightly
+com.brave.Browser.dev
+
+# ── Other VPN / Tor browsers ──────────────────────────────────────────────────
+org.torproject.torbrowser
+net.mullvad.MullvadBrowser
+com.hiddenreflex.Epic
+
+# ── Firefox forks (unmanageable by Layer 4) ───────────────────────────────────
+org.mozilla.firefox
+org.mozilla.firefoxdeveloperedition
+org.mozilla.nightly
+io.gitlab.librewolf-community
+org.waterfoxproject.waterfox
+org.mozilla.floorp
+app.zen-browser.zen

@@ -1,0 +1,158 @@
+#!/bin/bash
+set -euo pipefail
+
+DRY_RUN=false
+DNS_STATE=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)
+            DRY_RUN=true
+            ;;
+        --dns-state=*)
+            DRY_RUN=true
+            DNS_STATE="${arg#*=}"
+            ;;
+        --reset-dry-run)
+            rm -rf /tmp/blockdown-dry-run /tmp/lockdown-dry-run \
+                   /tmp/blockdown-dns-state-1 /tmp/blockdown-dns-state-2 /tmp/blockdown-dns-state-3 \
+                   /tmp/lockdown-dns-state-1 /tmp/lockdown-dns-state-2 /tmp/lockdown-dns-state-3
+            echo "Dry-run state cleared."
+            exit 0
+            ;;
+        --help|-h)
+            echo "Usage: ./blockdown [--dry-run] [--dns-state=N] [--reset-dry-run] [--help]"
+            echo ""
+            echo "  --dry-run         Run without making system changes"
+            echo "  --dns-state=N     Preview the DNS workflow in state N (1, 2, or 3)"
+            echo "                      1 = DNS not set up + bypasses not fixed"
+            echo "                      2 = DNS set up + bypasses not fixed"
+            echo "                      3 = DNS set up + bypasses fixed"
+            echo "  --reset-dry-run   Clear dry-run state and exit"
+            echo "  --help            Show this help"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Run './blockdown --help' for usage."
+            exit 1
+            ;;
+    esac
+done
+
+# Preview launcher: each DNS state gets its own isolated, freshly-seeded
+# dry-run instance so the experience is deterministic and reproducible.
+if [[ -n "$DNS_STATE" ]]; then
+    case "$DNS_STATE" in
+        1|2|3) export BLOCKDOWN_DRY_RUN_DIR="/tmp/blockdown-dns-state-${DNS_STATE}" ;;
+        *)
+            echo "Invalid --dns-state: '${DNS_STATE}'. Use 1, 2, or 3."
+            exit 1
+            ;;
+    esac
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for lib in core ui state onboarding removal websites apps dns settings; do
+    source "${SCRIPT_DIR}/lib/${lib}.sh"
+done
+
+# Menus hide the cursor (tput civis); make sure every exit path restores it,
+# including ctrl+c mid-menu, which otherwise leaves the terminal cursorless.
+trap 'tput cnorm >&2 2>/dev/null || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Preview launcher reseeds its dedicated state dir on every launch so each
+# state always reflects exactly what was requested.
+if [[ -n "$DNS_STATE" ]]; then
+    seed_dns_state "$DNS_STATE"
+fi
+
+init_state
+
+# Check for gum
+if [[ "$HAS_GUM" != "true" ]]; then
+    echo ""
+    ui_info "gum is not installed. Menus will use basic text input."
+    ui_info "For the best experience, run: ./setup"
+    echo ""
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    ui_warn "Dry-run mode. No system changes will be made."
+    ui_info "State stored in: ${BLOCKDOWN_STATE_DIR}"
+    echo ""
+fi
+
+# Onboarding if first run
+if [[ "$(config_get FIRST_RUN_COMPLETE)" != "true" ]]; then
+    screen_onboarding
+fi
+
+# Main menu loop
+screen_main_menu() {
+    while true; do
+        clear
+        local dry_suffix=""
+        [[ "$DRY_RUN" == "true" ]] && dry_suffix="[DRY RUN]"
+
+        local lock_label
+        case "$(unlock_method)" in
+            key)
+                lock_label="Unlock key"
+                ;;
+            none)
+                lock_label="No restrictions"
+                ;;
+            *)
+                local cooldown
+                cooldown=$(config_get COOLDOWN_SECONDS)
+                cooldown=${cooldown:-86400}
+                lock_label="Cooldown timer: $(format_duration "$cooldown")"
+                ;;
+        esac
+
+        local dns_filter host_count app_count status_line
+        dns_filter=$(_dns_filter)
+        host_count=$(host_block_count)
+        app_count=$(app_block_count)
+
+        ui_logo_compact "$dry_suffix"
+        status_line="${lock_label}  ·  $(pluralize "$host_count" site)  ·  $(pluralize "$app_count" app)"
+        if [[ -n "$dns_filter" && "$dns_filter" != "None" ]]; then
+            status_line+="  ·  ${dns_filter} filter"
+        fi
+        echo "  ${status_line}"
+        echo ""
+
+        # "Set up" reads wrong once a filter is active; the label follows state.
+        local dns_menu_label="Set up web filter"
+        _dns_has_category_filter && dns_menu_label="Web filter"
+
+        local choice=""
+        if ! choice=$(ui_choose "What would you like to do?" \
+            "Block websites" \
+            "Block apps" \
+            "$dns_menu_label" \
+            "Settings" \
+            "Quit"); then
+            echo ""
+            ui_info "Menu cancelled. Press return to redraw, or choose Quit from the menu."
+            ui_pause
+            continue
+        fi
+
+        case "$choice" in
+            "Block websites")   screen_websites ;;
+            "Block apps")       screen_apps ;;
+            "$dns_menu_label")  screen_dns ;;
+            "Settings")         screen_settings ;;
+            "Quit")             echo ""; echo "  Goodbye."; exit 0 ;;
+            "")                 continue ;;
+        esac
+    done
+}
+
+screen_main_menu

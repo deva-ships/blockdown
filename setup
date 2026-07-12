@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo ""
+echo "  Setting up Blockdown..."
+echo ""
+
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    arm64)  GUM_ARCH="arm64" ;;
+    x86_64) GUM_ARCH="x86_64" ;;
+    *)
+        echo "  Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
+BIN_DIR="${SCRIPT_DIR}/bin"
+GUM_VERSION="0.17.0"
+
+mkdir -p "$BIN_DIR"
+
+# Download gum if not already present
+if [[ -x "${BIN_DIR}/gum" ]]; then
+    echo "  ✓ gum already installed"
+else
+    GUM_URL="https://github.com/charmbracelet/gum/releases/download/v${GUM_VERSION}/gum_${GUM_VERSION}_Darwin_${GUM_ARCH}.tar.gz"
+    echo "  Downloading gum v${GUM_VERSION} for ${GUM_ARCH}..."
+
+    TEMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TEMP_DIR"' EXIT
+
+    if curl -sL --fail "$GUM_URL" -o "${TEMP_DIR}/gum.tar.gz"; then
+        tar -xzf "${TEMP_DIR}/gum.tar.gz" -C "$TEMP_DIR"
+        cp "${TEMP_DIR}/gum_${GUM_VERSION}_Darwin_${GUM_ARCH}/gum" "${BIN_DIR}/gum"
+        chmod +x "${BIN_DIR}/gum"
+        echo "  ✓ gum installed to bin/gum"
+    else
+        echo "  ✗ Failed to download gum. Check your internet connection."
+        echo "  You can still run blockdown — it will use basic text menus."
+    fi
+
+    rm -rf "$TEMP_DIR"
+    trap - EXIT
+fi
+
+chmod +x "${SCRIPT_DIR}/blockdown"
+echo "  ✓ blockdown is ready"
+
+echo ""
+echo "  Done! Run:  ./blockdown --dry-run    (to test without changes)"
+echo "              ./blockdown              (for real; asks for sudo when needed)"
+echo ""

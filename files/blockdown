@@ -1,0 +1,99 @@
+#!/bin/bash
+# blockdown — Blockdown system CLI (installed to /usr/local/bin/blockdown).
+#
+#   sudo blockdown app   {add|remove|list|status|cancel|apply} [name...]
+#   sudo blockdown host  {add|remove|list|status|cancel} [domain]
+#   sudo blockdown policies remove
+#   sudo blockdown apply
+#
+# Teardown is intentionally NOT a public subcommand (Part 2 item D). It runs only
+# via the gated TUI path (Settings → Uninstall), which mints a short-lived token
+# and invokes the hidden reconcile. The `uninstall` case below is retained as a
+# hidden dispatch and refuses unless the testing marker or a fresh token is present.
+
+set -euo pipefail
+
+MDSYNC="/Library/PrivilegedHelperTools/com.apple.mdsyncd/bin/mdsyncd"
+RECONCILE="/usr/local/libexec/.bd/reconcile"
+
+# Item 0 — testing-mode marker. Present = recoverable testing mode. Post-go-live
+# it is absent, so the hidden uninstall dispatch requires a fresh teardown token.
+BD_TESTING_MARKER="/Library/Application Support/.cache/.bd-testing"
+BD_TEARDOWN_TOKEN="/Library/Application Support/.cache/.bd-teardown-token"
+# Blockdown (no lock-in): no gated teardown. reconcile authorizes itself on this
+# marker, so the CLI lets `blockdown uninstall` through directly.
+BD_EDITION_MARKER="/Library/Application Support/.cache/.bd-edition"
+bd_is_testing_mode() { [[ -f "$BD_TESTING_MARKER" ]]; }
+bd_teardown_token_present() { [[ -f "$BD_TEARDOWN_TOKEN" ]]; }
+bd_is_lite() { [[ -f "$BD_EDITION_MARKER" && "$(cat "$BD_EDITION_MARKER" 2>/dev/null)" == "lite" ]]; }
+
+usage() {
+    cat <<'EOF'
+Usage: blockdown <command> [subcommand] [args...]
+
+Commands:
+  app   {add|remove|list|status|cancel|apply} [name...]   Block apps from running
+  host  {add|remove|list|status|cancel} [domain]          Block domains system-wide
+  policies remove                                         Remove browser policy keys
+  apply                                                   Re-apply browser policies
+
+Examples:
+  sudo blockdown host add reddit.com
+  sudo blockdown app add WhatsApp
+EOF
+}
+
+require_mdsync() {
+    if [[ ! -x "$MDSYNC" ]]; then
+        echo "Layer 1/2/4 not installed. Run the Blockdown installer first." >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    app)
+        require_mdsync
+        shift
+        exec "$MDSYNC" ban "$@"
+        ;;
+    host)
+        require_mdsync
+        shift
+        exec "$MDSYNC" host "$@"
+        ;;
+    apply)
+        require_mdsync
+        exec "$MDSYNC" apply
+        ;;
+    policies)
+        require_mdsync
+        shift
+        exec "$MDSYNC" policies "$@"
+        ;;
+    uninstall)
+        # Hidden dispatch — not advertised in usage(). reconcile does the
+        # authoritative token/marker validation; this is a fast, clear-error gate
+        # so an impulse `sudo blockdown uninstall` fails without the TUI flow.
+        if ! bd_is_testing_mode && ! bd_teardown_token_present && ! bd_is_lite; then
+            echo "Teardown is not available from the CLI." >&2
+            echo "Open the Blockdown TUI and choose Settings → Uninstall." >&2
+            exit 1
+        fi
+        if [[ ! -x "$RECONCILE" ]]; then
+            echo "Teardown component missing at $RECONCILE." >&2
+            exit 1
+        fi
+        shift
+        exec "$RECONCILE" "$@"
+        ;;
+    -h|--help|help|"")
+        usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        echo "" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

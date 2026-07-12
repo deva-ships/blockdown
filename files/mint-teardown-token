@@ -1,0 +1,44 @@
+#!/bin/bash
+# mint-teardown-token — root-only writer for the one-time teardown token.
+#
+# Part 2 item D. After the TUI's gate_action (unlock key / cooldown) clears, the
+# TUI calls this to mint a short-lived token, then calls `reconcile`. reconcile
+# refuses to run unless a fresh, root-owned token is present — so the only way to
+# reach teardown post-go-live (testing marker removed) is through the gated TUI
+# path within the token's lifetime.
+#
+# The token is deliberately NOT schg-locked: reconcile must consume (delete) it.
+# The friction lives in gate_action + this binary being the sole writer, both
+# reachable only via root. Installed to /usr/local/libexec/.bd (not on PATH).
+#
+# Format (two lines):
+#   <nonce hex>
+#   <expiry epoch seconds>
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "mint-teardown-token must run as root." >&2
+    exit 1
+fi
+
+TOKEN="/Library/Application Support/.cache/.bd-teardown-token"
+# 120s, not 60: the TUI runs `mint` then `reconcile` back-to-back, but the second
+# sudo can re-prompt for a password. A tight 60s window could expire while the
+# user types it; 120s keeps a comfortable margin without meaningfully widening the
+# gate (the friction is gate_action + being the sole root writer, not the TTL).
+TTL_SECONDS=120
+
+mkdir -p "$(dirname "$TOKEN")" 2>/dev/null || true
+
+# A stale token may linger (expired, or from an aborted teardown). Clear any
+# lock so we can overwrite it.
+chflags noschg "$TOKEN" 2>/dev/null || true
+
+nonce="$(head -c 16 /dev/urandom | xxd -p 2>/dev/null || openssl rand -hex 16)"
+expiry=$(( $(date +%s) + TTL_SECONDS ))
+
+umask 077
+printf '%s\n%s\n' "$nonce" "$expiry" > "$TOKEN"
+chown root:wheel "$TOKEN" 2>/dev/null || true
+chmod 600 "$TOKEN"

@@ -1,0 +1,1435 @@
+#!/bin/bash
+CONFIG="/Library/Application Support/.cache/hostsd.plist"
+BANNED_CONFIG="/Library/Application Support/.cache/bannedd.plist"
+HOSTS_STATE="/Library/Application Support/.cache/hostsd-state.plist"
+MANAGED_DIR="/Library/Managed Preferences"
+PREFERENCES_DIR="/Library/Preferences"
+PENDING_REMOVAL_APP_FILE="/Library/Application Support/.cache/pending_removal_app"
+PENDING_REMOVAL_HOST_FILE="/Library/Application Support/.cache/pending_removal_host"
+TESTING_MARKER="/Library/Application Support/.cache/dnsruled-testing"
+BD_TESTING_MARKER="/Library/Application Support/.cache/.bd-testing"
+# Blockdown edition marker (no lock-in). Present = no removal-resistance: schg
+# locks are skipped and the removal cooldown is bypassed, so blocks and state
+# stay editable/removable.
+BD_EDITION_MARKER="/Library/Application Support/.cache/.bd-edition"
+BROWSER_POLICIES_DISABLED="/Library/Application Support/.cache/browser-policies-disabled"
+REMOVAL_COOLDOWN_SECONDS=86400
+# Item C: powered-on-time gate. ~8640 ticks × 10s (killappsd) = 24h powered on.
+UPTIME_TICKS_FILE="/Library/Application Support/.cache/.uptime-ticks"
+REMOVAL_COOLDOWN_TICKS=8640
+BANNED_PROCESSES_FILE="/Library/Application Support/.cache/banned-processes.list"
+BANNED_BUNDLES_FILE="/Library/Application Support/.cache/banned-bundle-ids.list"
+BANNED_BUNDLE_PROVENANCE_FILE="/Library/Application Support/.cache/banned-bundle-provenance.list"
+LIB_SUPERVISE="/Library/PrivilegedHelperTools/com.apple.mdsyncd/bin/lib-supervise.sh"
+HOSTS_FILE="/etc/hosts"
+HOSTS_MARKER_START="# BLOCKER-MANAGED-START"
+HOSTS_MARKER_END="# BLOCKER-MANAGED-END"
+
+# Hardcoded preference domains always get a managed-plist write. Installed
+# Chromium forks not listed here are still caught by detect_chromium_browsers
+# (framework name + chrome_100_percent.pak fingerprint).
+CHROMIUM_BUNDLES="com.google.Chrome
+com.google.Chrome.beta
+com.google.Chrome.dev
+com.google.Chrome.canary
+com.microsoft.Edge
+com.microsoft.Edge.Beta
+com.microsoft.Edge.Dev
+com.microsoft.Edge.Canary
+com.brave.Browser
+com.brave.Browser.Beta
+com.brave.Browser.Nightly
+com.operasoftware.Opera
+com.operasoftware.OperaGX
+com.vivaldi.Vivaldi
+org.chromium.Chromium
+company.thebrowser.Browser
+company.thebrowser.dia
+com.thorium.Thorium
+com.github.Eloston.ungoogled-chromium
+com.kagi.kagimacOS
+net.imput.helium"
+
+CHROMIUM_VPN_EXT_BLOCKLIST="majdfhpaihoncoakbjgbdhglocklcgno
+gkojfkhlekighikafcpjkiklfbnlmeio
+omghfjlpggmjjaagoclmmobgdodcjboh
+fdcgdnkidjaadafnichfpabhfomcebme
+bihmplhobchoageeokmgbdihknkjbknd
+eppiocemhmnlbhjplcgkofciiegomcon
+oofgbpoabipfcfjapgnbbjjaenockbdp
+kpiecbcckbofpmkkkdibbllpinceiihk
+hnmpcagpplmpfojmgmnngilcnanddlhb
+fgddmllnllkalaagkghckoinaemmogpe
+poeojclicodamonabcabmapamjkkmnnk
+klnkiajpmpkkkgpgbogmcgfjhdoljacg
+kcdahmgmaagjhocpipbodaokikjkampi
+lnamjckmpocfgbnpcjmnnjlhokfangjo
+kcammpcoejjcfffncfobnjehigaolcdf
+obcanbbohbloohcaonbjlojnpkkkjpij
+njpmifchgidinihmijhcfpbdmglgfmjj
+ogbkgicanbpgkemjooahemnoihlihonp
+akcocjjpkmlniicdeemdceeajaiikjcd
+kcanidmpchplodphbjjblbhdaifmpdaa
+infpagefbmdijbaigeagmldkjnjdhhfa
+negffnhdpcjpedeijjkohcgaifnjlchg
+klejifgmmnkgejbhgmpgajemhlnijlib
+imocikjanlbflmejllpenghljjloligl
+iolonopooapdagdemdoaihahlfkncfgg"
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "This needs sudo."
+        exit 1
+    fi
+}
+
+is_testing_mode() {
+    [ -f "$TESTING_MARKER" ] || [ -f "$BD_TESTING_MARKER" ]
+}
+
+# Blockdown (no lock-in): the removal-resistance layer was never installed. schg
+# locking is a no-op and the removal cooldown is skipped so the user can
+# edit/remove freely.
+bd_is_lite() {
+    [ -f "$BD_EDITION_MARKER" ] && [ "$(cat "$BD_EDITION_MARKER" 2>/dev/null)" = "lite" ]
+}
+
+# Item C: current powered-on tick count (0 if the counter is missing/corrupt).
+read_ticks() {
+    local t
+    t=$(head -n 1 "$UPTIME_TICKS_FILE" 2>/dev/null)
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        echo "$t"
+    else
+        echo 0
+    fi
+}
+
+# Item C: a scheduled removal is ready only when BOTH the wall-clock delay and
+# the powered-on tick delay have elapsed. <sched_ticks> may be empty for a
+# legacy 2-line pending file — then the tick gate is skipped (wall-clock only).
+removal_ready() {
+    local ts="$1" sched_ticks="$2" now current
+    now=$(date +%s)
+    [ $(( now - ts )) -ge "$REMOVAL_COOLDOWN_SECONDS" ] || return 1
+    if [ -n "$sched_ticks" ]; then
+        current=$(read_ticks)
+        [ $(( current - sched_ticks )) -ge "$REMOVAL_COOLDOWN_TICKS" ] || return 1
+    fi
+    return 0
+}
+
+# Must not run inside command substitution — CONFIRMED must persist in the caller.
+_consume_confirmed_args() {
+    CONFIRMED=0
+    while [ "${1:-}" = "--confirmed" ]; do
+        CONFIRMED=1
+        shift
+    done
+    CONFIRMED_ARG="${1:-}"
+}
+
+skip_removal_cooldown() {
+    [ "$CONFIRMED" -eq 1 ] || is_testing_mode || bd_is_lite
+}
+
+# Safely parse a pending-removal file (item, epoch timestamp, and — since Item C
+# — an optional 3rd line: the tick count at scheduling time).
+# Prints "ITEM<TAB>TIMESTAMP<TAB>TICKS" on stdout (TICKS empty for a legacy
+# 2-line file), or nothing if the file is missing/corrupt.
+# A corrupt file must NOT look like "ready to remove" — that would silently bypass
+# the delay on a disk-full or partial-write event. A present-but-non-numeric
+# 3rd line is treated as corruption.
+parse_pending_file() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    local item ts ticks
+    item=$(head -n 1 "$file" 2>/dev/null)
+    ts=$(sed -n '2p' "$file" 2>/dev/null)
+    ticks=$(sed -n '3p' "$file" 2>/dev/null)
+    # Timestamp must be a positive integer (10 digits for recent epochs).
+    if [ -z "$item" ] || [ -z "$ts" ] || ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    # 3rd line is optional; if present it must be a positive integer.
+    if [ -n "$ticks" ] && ! [[ "$ticks" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\t%s\t%s\n' "$item" "$ts" "$ticks"
+}
+
+read_banned_names() {
+    local encoded
+    encoded=$(/usr/libexec/PlistBuddy -c "Print :CacheValidationApps" "$BANNED_CONFIG" 2>/dev/null | tr -d ' \n')
+    if [ -z "$encoded" ]; then
+        return
+    fi
+    echo "$encoded" | /usr/bin/base64 -D 2>/dev/null
+}
+
+# --- Layer 2 state-file immutability (Item A) ---
+# Mirror the hosts_state_unlock/lock pattern for the app-blocking state files so a
+# tamper (edit/delete) requires clearing schg first, self-healed on next apply.
+# On Blockdown the *_lock helpers no-op: the state files stay editable/removable.
+
+banned_config_unlock() {
+    chflags noschg "$BANNED_CONFIG" 2>/dev/null
+}
+
+banned_config_lock() {
+    bd_is_lite && return 0
+    chflags schg "$BANNED_CONFIG" 2>/dev/null
+}
+
+banned_processes_unlock() {
+    chflags noschg "$BANNED_PROCESSES_FILE" 2>/dev/null
+}
+
+banned_processes_lock() {
+    bd_is_lite && return 0
+    chflags schg "$BANNED_PROCESSES_FILE" 2>/dev/null
+}
+
+bundle_list_unlock() {
+    chflags noschg "$BANNED_BUNDLES_FILE" 2>/dev/null
+}
+
+bundle_list_lock() {
+    bd_is_lite && return 0
+    chflags schg "$BANNED_BUNDLES_FILE" 2>/dev/null
+}
+
+provenance_unlock() {
+    chflags noschg "$BANNED_BUNDLE_PROVENANCE_FILE" 2>/dev/null
+}
+
+provenance_lock() {
+    bd_is_lite && return 0
+    chflags schg "$BANNED_BUNDLE_PROVENANCE_FILE" 2>/dev/null
+}
+
+# Search roots for installed .app bundles (same coverage as resolve_app_name).
+_app_search_roots() {
+    local -a search_roots=(/Applications)
+    local user_home sub
+
+    for user_home in /Users/*/; do
+        case "$(basename "${user_home%/}")" in Shared) continue ;; esac
+        for sub in Applications Desktop Documents Downloads; do
+            [ -d "${user_home}${sub}" ] && search_roots+=("${user_home}${sub}")
+        done
+    done
+
+    printf '%s\n' "${search_roots[@]}"
+}
+
+_is_real_app_bundle() {
+    local app_path="$1"
+    [ -d "$app_path/Contents" ] || return 1
+    [ -f "$app_path" ] && [ ! -s "$app_path" ] && return 1
+    return 0
+}
+
+_read_bundle_id() {
+    local app_path="$1"
+    local bid
+    _is_real_app_bundle "$app_path" || return 1
+    bid=$(defaults read "$app_path/Contents/Info" CFBundleIdentifier 2>/dev/null)
+    [ -n "$bid" ] || return 1
+    echo "$bid"
+}
+
+# Collect CFBundleIdentifiers for installed .app bundles matching display names.
+# Uses find (works as root); mdfind is unreliable from daemons.
+harvest_bundle_ids_for_names() {
+    local names="$1"
+    local name base_name root app_path bid
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        base_name="$name"
+        while IFS= read -r root; do
+            app_path="${root}/${base_name}.app"
+            bid=$(_read_bundle_id "$app_path" 2>/dev/null) && echo "$bid"
+            while IFS= read -r app_path; do
+                [ -z "$app_path" ] && continue
+                case "$(basename "$app_path")" in
+                    "${base_name}"*.app) ;;
+                    *) continue ;;
+                esac
+                bid=$(_read_bundle_id "$app_path" 2>/dev/null) && echo "$bid"
+            done < <(find "$root" -maxdepth 5 -type d -name "${base_name}*.app" 2>/dev/null)
+        done < <(_app_search_roots)
+    done <<< "$names" | awk 'NF' | sort -u
+}
+
+# Resolve one display name to bundle IDs from installed copies on disk.
+bundle_ids_for_app_name() {
+    local input="$1"
+    local resolved
+    resolved=$(resolve_app_name "$input")
+    harvest_bundle_ids_for_names "$(generate_app_variants "$resolved")"
+}
+
+# True when an installed .app with bundle ID bid matches a display-name variant.
+bundle_id_belongs_to_name_variants() {
+    local bid="$1"
+    local variants="$2"
+    local root app_path name bid_app variant
+
+    while IFS= read -r root; do
+        while IFS= read -r app_path; do
+            bid_app=$(_read_bundle_id "$app_path" 2>/dev/null) || continue
+            [ "$bid_app" = "$bid" ] || continue
+            name="$(basename "$app_path" .app)"
+            while IFS= read -r variant; do
+                [ -z "$variant" ] && continue
+                _icase_equal "$name" "$variant" && return 0
+            done <<< "$variants"
+        done < <(find "$root" -maxdepth 5 -type d -name "*.app" 2>/dev/null)
+    done < <(_app_search_roots)
+    return 1
+}
+
+# Bundle IDs killappsd's harvest pass recorded for a banned display-name variant.
+bundle_ids_from_provenance() {
+    local names="$1"
+    local name
+
+    [ -f "$BANNED_BUNDLE_PROVENANCE_FILE" ] || return 0
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        awk -F'|' -v name="$name" '$1 == name { print $2 }' "$BANNED_BUNDLE_PROVENANCE_FILE" 2>/dev/null
+    done <<< "$names" | awk 'NF' | sort -u
+}
+
+# Drop provenance rows for unblocked name variants.
+prune_provenance_for_variants() {
+    local variants="$1"
+    local tmp name
+
+    [ -f "$BANNED_BUNDLE_PROVENANCE_FILE" ] || return 0
+    tmp="${BANNED_BUNDLE_PROVENANCE_FILE}.tmp"
+    cp "$BANNED_BUNDLE_PROVENANCE_FILE" "$tmp" 2>/dev/null || return 0
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        awk -F'|' -v name="$name" '$1 != name { print }' "$tmp" > "${tmp}.new" \
+            && mv -f "${tmp}.new" "$tmp"
+    done <<< "$variants"
+
+    provenance_unlock
+    rm -f "$BANNED_BUNDLE_PROVENANCE_FILE" 2>/dev/null
+    mv -f "$tmp" "$BANNED_BUNDLE_PROVENANCE_FILE" 2>/dev/null
+    chmod 644 "$BANNED_BUNDLE_PROVENANCE_FILE" 2>/dev/null
+    provenance_lock
+    rm -f "${tmp}.new"
+}
+
+write_bundle_list_contents() {
+    local content="$1"
+    local tmp="${BANNED_BUNDLES_FILE}.tmp"
+
+    printf '%s' "$content" > "$tmp"
+    bundle_list_unlock
+    rm -f "$BANNED_BUNDLES_FILE" 2>/dev/null
+    mv -f "$tmp" "$BANNED_BUNDLES_FILE" 2>/dev/null
+    chmod 644 "$BANNED_BUNDLES_FILE" 2>/dev/null
+    bundle_list_lock
+}
+
+# Drop bundle IDs harvested for an unblocked app unless another banned app still
+# needs them (e.g. the harvest pass appended com.brave.Browser while Brave was blocked).
+# Aggressively matches variants to catch stale entries from older harvests.
+remove_unblocked_bundle_ids() {
+    local removed_name="$1"
+    local remaining_names="$2"
+    local removed_variants remaining_variants to_remove to_keep bid current
+
+    [ -f "$BANNED_BUNDLES_FILE" ] || return 0
+
+    removed_variants=$(generate_app_variants "$removed_name")
+
+    remaining_variants=""
+    if [ -n "$remaining_names" ]; then
+        while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            remaining_variants="${remaining_variants}$(generate_app_variants "$n")
+"
+        done <<< "$remaining_names"
+    fi
+
+    to_remove=$(
+        {
+            harvest_bundle_ids_for_names "$removed_variants"
+            bundle_ids_for_app_name "$removed_name"
+            bundle_ids_from_provenance "$removed_variants"
+            
+            # Aggressive fuzzy match against the live bundle list to catch stale entries.
+            # If we accidentally over-remove an ID for an app that is STILL blocked,
+            # killappsd's harvest pass will safely re-harvest it on the next 10s tick.
+            while IFS= read -r bid; do
+                [ -z "$bid" ] && continue
+                local bid_clean
+                bid_clean=$(echo "$bid" | tr -d '.' | tr '[:upper:]' '[:lower:]')
+                while IFS= read -r variant; do
+                    [ -z "$variant" ] && continue
+                    local var_clean
+                    var_clean=$(echo "$variant" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+                    if [[ "$bid_clean" == *"$var_clean"* ]]; then
+                        echo "$bid"
+                        break
+                    fi
+                done <<< "$removed_variants"
+            done < "$BANNED_BUNDLES_FILE"
+        } | awk 'NF' | sort -u
+    )
+    [ -n "$to_remove" ] || {
+        prune_provenance_for_variants "$removed_variants"
+        return 0
+    }
+
+    to_keep=$(
+        {
+            harvest_bundle_ids_for_names "$remaining_variants"
+        } | awk 'NF' | sort -u
+    )
+
+    current=$(cat "$BANNED_BUNDLES_FILE" 2>/dev/null)
+    while IFS= read -r bid; do
+        [ -z "$bid" ] && continue
+        if [ -n "$to_keep" ] && echo "$to_keep" | grep -qxF "$bid"; then
+            continue
+        fi
+        current=$(printf '%s\n' "$current" | grep -vxF "$bid")
+    done <<< "$to_remove"
+
+    write_bundle_list_contents "$current"
+    prune_provenance_for_variants "$removed_variants"
+}
+
+write_banned_names() {
+    local names="$1"
+    local encoded
+    encoded=$(echo -n "$names" | base64)
+    banned_config_unlock
+    if [ ! -f "$BANNED_CONFIG" ]; then
+        /usr/bin/defaults write "${BANNED_CONFIG%.plist}" _init -bool true 2>/dev/null
+        /usr/libexec/PlistBuddy -c "Delete :_init" "$BANNED_CONFIG" 2>/dev/null
+    fi
+    /usr/libexec/PlistBuddy -c "Delete :CacheValidationApps" "$BANNED_CONFIG" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :CacheValidationApps data $encoded" "$BANNED_CONFIG" 2>/dev/null
+    chmod 644 "$BANNED_CONFIG" 2>/dev/null
+    banned_config_lock
+}
+
+# --- Hosts-file helpers (Layer 1) ---
+
+hosts_unlock() {
+    chflags noschg "$HOSTS_FILE" 2>/dev/null
+}
+
+hosts_lock() {
+    bd_is_lite && return 0
+    chflags schg "$HOSTS_FILE" 2>/dev/null
+}
+
+hosts_state_unlock() {
+    chflags noschg "$HOSTS_STATE" 2>/dev/null
+}
+
+hosts_state_lock() {
+    bd_is_lite && return 0
+    chflags schg "$HOSTS_STATE" 2>/dev/null
+}
+
+flush_dns() {
+    dscacheutil -flushcache 2>/dev/null
+    killall -HUP mDNSResponder 2>/dev/null
+}
+
+validate_domain() {
+    local domain="$1"
+    # Bare domain: letters/digits/dots/hyphens, at least one dot, no scheme/path/space.
+    if [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# --- State file (source of truth for Layer 1 managed hosts) ---
+
+read_hosts_state() {
+    local encoded
+    encoded=$(/usr/libexec/PlistBuddy -c "Print :CacheValidationHosts" "$HOSTS_STATE" 2>/dev/null | tr -d ' \n')
+    if [ -z "$encoded" ]; then
+        return
+    fi
+    echo "$encoded" | /usr/bin/base64 -D 2>/dev/null
+}
+
+write_hosts_state() {
+    local names="$1"
+    local encoded
+    encoded=$(echo -n "$names" | base64)
+    hosts_state_unlock
+    if [ ! -f "$HOSTS_STATE" ]; then
+        /usr/bin/defaults write "${HOSTS_STATE%.plist}" _init -bool true 2>/dev/null
+        /usr/libexec/PlistBuddy -c "Delete :_init" "$HOSTS_STATE" 2>/dev/null
+    fi
+    /usr/libexec/PlistBuddy -c "Delete :CacheValidationHosts" "$HOSTS_STATE" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :CacheValidationHosts data $encoded" "$HOSTS_STATE" 2>/dev/null
+    chmod 644 "$HOSTS_STATE" 2>/dev/null
+    hosts_state_lock
+}
+
+# Read domains currently present in the /etc/hosts managed block (for migration + idempotency check).
+list_hosts_from_file() {
+    awk -v s="$HOSTS_MARKER_START" -v e="$HOSTS_MARKER_END" '
+        $0 == s { inside = 1; next }
+        $0 == e { inside = 0; next }
+        inside && /^0\.0\.0\.0 / { print $2 }
+    ' "$HOSTS_FILE" 2>/dev/null
+}
+
+# Public accessor used by cmd_host_* — returns domains from state (source of truth).
+list_managed_hosts() {
+    read_hosts_state
+}
+
+# True once Layer 1 state has been written at least once (including an empty block list).
+_hosts_state_initialized() {
+    [ -f "$HOSTS_STATE" ] || return 1
+    /usr/libexec/PlistBuddy -c "Print :CacheValidationHosts" "$HOSTS_STATE" >/dev/null 2>&1
+}
+
+# Resolve a blocked host to its canonical bare form for lookups.
+_host_canonical() {
+    local domain="$1"
+    domain="${domain#www.}"
+    echo "$domain"
+}
+
+is_host_blocked() {
+    local domain="$1"
+    local canonical state
+    canonical=$(_host_canonical "$domain")
+    state=$(read_hosts_state)
+    echo "$state" | grep -Fxq "$canonical" 2>/dev/null \
+        || echo "$state" | grep -Fxq "www.${canonical}" 2>/dev/null \
+        || echo "$state" | grep -Fxq "$domain" 2>/dev/null
+}
+
+# Rewrite the /etc/hosts managed block from the given newline-separated domain list.
+# Preserves everything outside the markers. Caller is responsible for unlock/lock + flush.
+# Uses mktemp in /etc/ (same filesystem as target) + atomic mv so a mid-write crash
+# never leaves /etc/hosts empty or half-written.
+rewrite_managed_block() {
+    local domains="$1"
+    local tmp
+    tmp=$(mktemp "${HOSTS_FILE}.XXXXXX") || return 1
+
+    # Strip any existing managed block; keep everything outside.
+    awk -v s="$HOSTS_MARKER_START" -v e="$HOSTS_MARKER_END" '
+        $0 == s { inside = 1; next }
+        $0 == e { inside = 0; next }
+        !inside { print }
+    ' "$HOSTS_FILE" > "$tmp"
+
+    # Trim trailing blank lines so the appended block has a single leading blank line.
+    awk 'BEGIN{n=0} {arr[n++]=$0} END {
+        last = n - 1
+        while (last >= 0 && arr[last] ~ /^[[:space:]]*$/) last--
+        for (i = 0; i <= last; i++) print arr[i]
+    }' "$tmp" > "${tmp}.trimmed"
+    mv "${tmp}.trimmed" "$tmp"
+
+    # Append fresh managed block.
+    echo "" >> "$tmp"
+    echo "$HOSTS_MARKER_START" >> "$tmp"
+    if [ -n "$domains" ]; then
+        echo "$domains" | while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            echo "0.0.0.0 $d"
+            echo "::1 $d"
+        done >> "$tmp"
+    fi
+
+    # YouTube Restricted Mode enforcement removed by user request
+
+    echo "$HOSTS_MARKER_END" >> "$tmp"
+
+    # Preserve ownership/perms before the atomic rename.
+    chmod 644 "$tmp" 2>/dev/null
+    chown root:wheel "$tmp" 2>/dev/null
+    mv -f "$tmp" "$HOSTS_FILE"
+}
+
+# Reconcile /etc/hosts with the state file. Idempotent; safe to call on every daemon cycle.
+#   - First run: if state was never initialized but /etc/hosts already has a managed
+#     block, migrate (seed state from file, return without rewriting).
+#   - Subsequent runs: if state != file, rewrite file from state (self-heals tampering).
+apply_hosts() {
+    local state_list file_list
+    state_list=$(read_hosts_state)
+    file_list=$(list_hosts_from_file)
+
+    # First-run migration only — not when the block list was intentionally cleared.
+    if ! _hosts_state_initialized && [ -n "$file_list" ]; then
+        write_hosts_state "$file_list"
+        return 0
+    fi
+
+    # Idempotency: compare sorted sets. No diff → no-op (no file write, no DNS flush).
+    if [ "$(echo "$file_list" | sort)" = "$(echo "$state_list" | sort)" ]; then
+        return 0
+    fi
+
+    # State and file diverge → rewrite file from state.
+    hosts_unlock
+    rewrite_managed_block "$state_list"
+    hosts_lock
+    flush_dns
+}
+
+detect_chromium_browsers() {
+    echo "$CHROMIUM_BUNDLES"
+
+    # Search common install/sideload paths. Skip Pictures and Music — they trigger
+    # macOS Photos/Music TCC prompts and aren't realistic browser locations.
+    local -a search_roots=(/Applications)
+    local user_home sub
+    for user_home in /Users/*/; do
+        [[ "$(basename "${user_home%/}")" == "Shared" ]] && continue
+        for sub in Applications Desktop Documents Downloads bin Apps apps; do
+            [[ -d "${user_home}${sub}" ]] && search_roots+=("${user_home}${sub}")
+        done
+    done
+
+    local apps="" root
+    for root in "${search_roots[@]}"; do
+        while IFS= read -r app; do
+            apps+="${app}"$'\n'
+        done < <(find "$root" -maxdepth 5 -type d -name "*.app" 2>/dev/null)
+    done
+
+    echo "$apps" | while IFS= read -r app; do
+        [ -z "$app" ] && continue
+        [ -d "$app/Contents/Frameworks" ] || continue
+
+        # Chromium-family (not Electron): branded framework name, or the
+        # chrome_100_percent.pak resource that every Chromium fork ships even
+        # when the framework is renamed (Helium, Iron, Dragon, Iridium, etc.).
+        is_chromium=0
+        if ls "$app/Contents/Frameworks/" 2>/dev/null \
+            | grep -qiE '(chromium|chrome|whale|tempest|cent|helium|iron|dragon|iridium|slimjet|torch|coccoc|catsxp|kinza|cromite|thorium) framework'; then
+            is_chromium=1
+        else
+            for pak in "$app"/Contents/Frameworks/*.framework/Versions/*/Resources/chrome_100_percent.pak; do
+                if [ -f "$pak" ]; then
+                    is_chromium=1
+                    break
+                fi
+            done
+        fi
+        [ "$is_chromium" -eq 1 ] || continue
+
+        bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+        [ -n "$bid" ] && echo "$bid"
+    done
+}
+
+apply_chromium_extras() {
+    # Browser Policies 3.0 additions for a single $plist in scope.
+    local plist="$1"
+
+    # ProxySettings: force no proxy — VPN extensions using chrome.proxy get rejected.
+    /usr/libexec/PlistBuddy -c "Delete :ProxySettings" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ProxySettings dict" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ProxySettings:ProxyMode string direct" "$plist" 2>/dev/null
+
+    # ExtensionSettings: strip the 'proxy' permission from every extension globally.
+    /usr/libexec/PlistBuddy -c "Delete :ExtensionSettings" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ExtensionSettings dict" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ExtensionSettings:* dict" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ExtensionSettings:*:installation_mode string allowed" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ExtensionSettings:*:blocked_permissions array" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ExtensionSettings:*:blocked_permissions:0 string proxy" "$plist" 2>/dev/null
+
+    # ExtensionInstallBlocklist: explicit list of known VPN extension IDs.
+    /usr/libexec/PlistBuddy -c "Delete :ExtensionInstallBlocklist" "$plist" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :ExtensionInstallBlocklist array" "$plist" 2>/dev/null
+    echo "$CHROMIUM_VPN_EXT_BLOCKLIST" | while IFS= read -r ext; do
+        [ -z "$ext" ] && continue
+        /usr/libexec/PlistBuddy -c "Add :ExtensionInstallBlocklist: string $ext" "$plist" 2>/dev/null
+    done
+
+    # ExtensionInstallForcelist: explicitly empty (cleans up any stale forced extensions
+    # from the retired enforce-browser-policy worker).
+    /usr/libexec/PlistBuddy -c "Delete :ExtensionInstallForcelist" "$plist" 2>/dev/null
+}
+
+ensure_managed_plist() {
+    local plist="$1"
+    [ -f "$plist" ] && return 0
+    # PlistBuddy cannot Add keys to a file that does not exist yet.
+    /usr/bin/defaults write "${plist%.plist}" _init -bool true 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Delete :_init" "$plist" 2>/dev/null
+}
+
+_icase_equal() {
+    [ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ]
+}
+
+_banned_contains() {
+    local needle="$1"
+    local names="$2"
+    local existing
+    while IFS= read -r existing; do
+        [ -z "$existing" ] && continue
+        _icase_equal "$existing" "$needle" && return 0
+    done <<< "$names"
+    return 1
+}
+
+_banned_find() {
+    local needle="$1"
+    local names="$2"
+    local existing
+    while IFS= read -r existing; do
+        [ -z "$existing" ] && continue
+        if _icase_equal "$existing" "$needle"; then
+            echo "$existing"
+            return 0
+        fi
+    done <<< "$names"
+    return 1
+}
+
+# Match user input to an installed .app name when possible (e.g. spotify -> Spotify).
+resolve_app_name() {
+    local input="${1%.app}"
+    local -a search_roots=(/Applications)
+    local user_home sub root app name
+
+    for user_home in /Users/*/; do
+        case "$(basename "${user_home%/}")" in Shared) continue ;; esac
+        for sub in Applications Desktop Documents Downloads; do
+            [ -d "${user_home}${sub}" ] && search_roots+=("${user_home}${sub}")
+        done
+    done
+
+    for root in "${search_roots[@]}"; do
+        while IFS= read -r app; do
+            [ -z "$app" ] && continue
+            [ -d "$app/Contents" ] || continue
+            [ -f "$app" ] && [ ! -s "$app" ] && continue
+            name="${app##*/}"
+            name="${name%.app}"
+            if _icase_equal "$name" "$input"; then
+                echo "$name"
+                return 0
+            fi
+        done < <(find "$root" -maxdepth 5 -type d -name "*.app" 2>/dev/null)
+    done
+
+    echo "$input"
+}
+
+app_case_variants() {
+    local name="$1"
+    local lower upper title
+    [ -z "$name" ] && return
+    lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+    upper=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+    title=$(printf '%s' "$lower" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+    echo "$name"
+    echo "$lower"
+    echo "$upper"
+    echo "$title"
+}
+
+generate_app_variants() {
+    local input="$1"
+    # Remove common suffixes to find the core name
+    local core
+    core=$(echo "$input" | sed -E 's/ *(App|Browser|Desktop|Mac|Client|Pro|Beta|Nightly|Dev|Canary|Player)$//i')
+    
+    local nospace
+    nospace=$(echo "$core" | tr -d ' ')
+    
+    local withspace
+    if [[ "$core" != *" "* ]]; then
+        # Add spaces before capital letters (e.g. GoogleChrome -> Google Chrome)
+        withspace=$(echo "$core" | sed -E 's/([a-z])([A-Z])/\1 \2/g')
+    else
+        withspace="$core"
+    fi
+    
+    (
+        echo "$input"
+        for base in "$core" "$nospace" "$withspace"; do
+            [ -z "$base" ] && continue
+            echo "$base"
+            echo "${base} Browser"
+            echo "${base} Desktop"
+            echo "${base} App"
+            echo "${base} Mac"
+        done
+    ) | while IFS= read -r variant; do
+        [ -z "$variant" ] && continue
+        app_case_variants "$variant"
+    done | awk 'NF' | sort -u
+}
+
+apply_app_blocks() {
+    # Read the banned-names list and rewrite the derived process-match list
+    # (consumed by killappsd). No placeholder files are created — blocking is
+    # enforced by killappsd (kill-on-launch by path/bundle ID), and killappsd's
+    # reconcile pass sweeps any leftover state on every tick.
+    local names
+    names=$(read_banned_names)
+
+    local expanded_names=""
+    if [ -n "$names" ]; then
+        local new_expanded=""
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            local variants
+            variants=$(generate_app_variants "$name")
+            new_expanded="${new_expanded}${variants}
+"
+        done <<< "$names"
+        expanded_names=$(echo "$new_expanded" | awk 'NF' | sort -u)
+    fi
+
+    # (1) Rebuild process-match list. Always rewrite, even if empty.
+    local tmp="${BANNED_PROCESSES_FILE}.tmp"
+    : > "$tmp"
+    if [ -n "$expanded_names" ]; then
+        echo "$expanded_names" | while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            echo "${name}.app/Contents/MacOS" >> "$tmp"
+        done
+    fi
+    banned_processes_unlock
+    mv -f "$tmp" "$BANNED_PROCESSES_FILE"
+    chmod 644 "$BANNED_PROCESSES_FILE" 2>/dev/null
+    banned_processes_lock
+
+    # No placeholder files. Enforcement is kill-on-launch (killappsd Pass 1/2);
+    # any 0-byte *.app litter from older versions is swept by killappsd's
+    # reconcile pass, which converges all derived state to this names list.
+}
+
+browser_policies_disabled() {
+    [ -f "$BROWSER_POLICIES_DISABLED" ]
+}
+
+disable_browser_policies() {
+    mkdir -p "$(dirname "$BROWSER_POLICIES_DISABLED")" 2>/dev/null
+    : > "$BROWSER_POLICIES_DISABLED"
+    chmod 644 "$BROWSER_POLICIES_DISABLED" 2>/dev/null
+}
+
+enable_browser_policies() {
+    rm -f "$BROWSER_POLICIES_DISABLED"
+}
+
+apply_chromium_policies() {
+    # Ensure the managed-prefs dir exists. On a fresh macOS install that has never
+    # had MDM or user-installed profiles, /Library/Managed Preferences may not exist,
+    # and PlistBuddy would silently fail on every write.
+    mkdir -p "$MANAGED_DIR" 2>/dev/null
+    chown root:wheel "$MANAGED_DIR" 2>/dev/null
+    chmod 755 "$MANAGED_DIR" 2>/dev/null
+
+    local bundles
+    bundles=$(detect_chromium_browsers | sort -u)
+
+    echo "$bundles" | while IFS= read -r bundle; do
+        [ -z "$bundle" ] && continue
+        local plist="$MANAGED_DIR/$bundle.plist"
+        ensure_managed_plist "$plist"
+        # URLBlocklist (URL-path blocking) is out of scope; Blockdown blocks whole domains.
+        /usr/libexec/PlistBuddy -c "Delete :URLBlocklist" "$plist" 2>/dev/null
+
+        /usr/libexec/PlistBuddy -c "Delete :DnsOverHttpsMode" "$plist" 2>/dev/null
+        /usr/libexec/PlistBuddy -c "Add :DnsOverHttpsMode string off" "$plist" 2>/dev/null
+        # Leave BuiltInDnsClientEnabled at Chrome's default (true). DnsOverHttpsMode=off
+        # already blocks browser DoH bypass; forcing the system resolver made Chrome
+        # brittle whenever local DNS (127.0.0.1) restarted during filter testing.
+        /usr/libexec/PlistBuddy -c "Delete :BuiltInDnsClientEnabled" "$plist" 2>/dev/null
+
+        /usr/libexec/PlistBuddy -c "Delete :ForceGoogleSafeSearch" "$plist" 2>/dev/null
+        /usr/libexec/PlistBuddy -c "Add :ForceGoogleSafeSearch bool true" "$plist" 2>/dev/null
+
+        /usr/libexec/PlistBuddy -c "Delete :ForceYouTubeRestrict" "$plist" 2>/dev/null
+
+        apply_chromium_extras "$plist"
+
+        chmod 644 "$plist" 2>/dev/null
+    done
+}
+
+_chromium_policy_keys_present() {
+    # Fast binary grep before slow plutil parse
+    grep -qE 'ExtensionInstallBlocklist|ProxySettings|ExtensionSettings|DnsOverHttpsMode|ForceGoogleSafeSearch' "$1" 2>/dev/null || return 1
+    plutil -p "$1" 2>/dev/null \
+        | grep -qE 'ExtensionInstallBlocklist|ProxySettings|ExtensionSettings|DnsOverHttpsMode|ForceGoogleSafeSearch'
+}
+
+cleanup_chromium_plists() {
+    # Delete every plist that carries Blockdown browser-policy keys — not only
+    # bundle IDs returned by detect_chromium_browsers (orphan beta/dev plists
+    # and stale files after partial uninstall must go too).
+    local dir plist
+    for dir in "$MANAGED_DIR" "$PREFERENCES_DIR"; do
+        [ -d "$dir" ] || continue
+        for plist in "$dir"/*.plist; do
+            [ -f "$plist" ] || continue
+            [ "$(basename "$plist")" = "com.apple.dnsSettings.managed.plist" ] && continue
+            _chromium_policy_keys_present "$plist" || continue
+            chflags nouchg,noschg "$plist" 2>/dev/null || true
+            rm -f "$plist"
+        done
+    done
+}
+
+chromium_browsers_running() {
+    local name
+    for name in "Google Chrome" "Brave Browser" "Microsoft Edge" "Chromium" \
+        "Opera" "Opera GX" "Vivaldi" "Arc" "Dia" "Thorium" "LibreWolf"; do
+        pgrep -xq "$name" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+quit_chromium_browsers() {
+    chromium_browsers_running || return 0
+    local -a names=(
+        "Google Chrome"
+        "Brave Browser"
+        "Microsoft Edge"
+        "Chromium"
+        "Opera"
+        "Opera GX"
+        "Vivaldi"
+        "Arc"
+        "Dia"
+        "Thorium"
+        "LibreWolf"
+    )
+    local name
+    for name in "${names[@]}"; do
+        killall "$name" 2>/dev/null || true
+    done
+    sleep 0.3
+    for name in "${names[@]}"; do
+        killall "$name" 2>/dev/null || true
+    done
+}
+
+flush_preference_cache() {
+    local console_user
+    console_user=$(stat -f '%Su' /dev/console 2>/dev/null)
+
+    # Root cfprefsd holds machine-wide managed preferences.
+    killall cfprefsd 2>/dev/null || true
+
+    # Logged-in user cfprefsd is what Chrome reads on a normal Mac session.
+    if [ -n "$console_user" ] && [ "$console_user" != "root" ]; then
+        su "$console_user" -c "killall cfprefsd" 2>/dev/null \
+            || killall -u "$console_user" cfprefsd 2>/dev/null || true
+    fi
+}
+
+apply_policies() {
+    if browser_policies_disabled; then
+        cleanup_chromium_plists
+    else
+        apply_chromium_policies
+    fi
+    apply_app_blocks
+    apply_hosts
+}
+
+cmd_apply() {
+    require_root
+    # Item B: cyclic supervision backstop (hourly + on every WatchPaths trigger).
+    # No-op while the testing marker is present.
+    if [ -f "$LIB_SUPERVISE" ]; then
+        # shellcheck source=/dev/null
+        . "$LIB_SUPERVISE"
+        type supervise_all >/dev/null 2>&1 && supervise_all
+    fi
+    apply_policies
+    echo "Policies reapplied."
+}
+
+cmd_policies_remove() {
+    require_root
+    # Set before touching plists — WatchPaths on Managed Preferences would
+    # otherwise trigger an immediate re-apply from the hourly daemon.
+    disable_browser_policies
+    quit_chromium_browsers
+    cleanup_chromium_plists
+    flush_preference_cache
+    echo "Browser policies removed."
+}
+
+cmd_policies_enable() {
+    require_root
+    enable_browser_policies
+    apply_chromium_policies
+    quit_chromium_browsers
+    flush_preference_cache
+    echo "Browser policies enabled and applied."
+}
+
+cmd_ban_add() {
+    require_root
+    if [ -z "$1" ]; then
+        echo "Usage: blockdown app add <app-name> [<app-name>...]"
+        echo "  Names are app display names without the .app suffix (e.g., \"BlueStacks\")."
+        echo "  Multiple names can be added in one call."
+        exit 1
+    fi
+
+    local names
+    names=$(read_banned_names)
+    local added=""
+    local skipped=""
+
+    for arg in "$@"; do
+        [ -z "$arg" ] && continue
+        # Normalize: strip trailing .app if user included it, then resolve installed casing.
+        local name
+        name=$(resolve_app_name "${arg%.app}")
+
+        if [ -n "$names" ] && _banned_contains "$name" "$names"; then
+            skipped="${skipped}  ${name}
+"
+            continue
+        fi
+
+        if [ -z "$names" ]; then
+            names="$name"
+        else
+            names="$names
+$name"
+        fi
+        added="${added}  ${name}
+"
+    done
+
+    write_banned_names "$names"
+    apply_app_blocks
+
+    if [ -n "$added" ]; then
+        echo "Added:"
+        printf "%s" "$added"
+    fi
+    if [ -n "$skipped" ]; then
+        echo "Already banned (skipped):"
+        printf "%s" "$skipped"
+    fi
+}
+
+cmd_ban_list() {
+    local names
+    names=$(read_banned_names)
+    if [ -z "$names" ]; then
+        echo "No apps banned."
+    else
+        echo "$names"
+    fi
+}
+
+_ban_remove_now() {
+    local name="$1"
+    local names new_names names_to_delete del_name target
+
+    names=$(read_banned_names)
+    new_names=$(echo "$names" | grep -Fxv "$name")
+    write_banned_names "$new_names"
+    apply_app_blocks
+    remove_unblocked_bundle_ids "$name" "$new_names"
+
+    names_to_delete=$(generate_app_variants "$name")
+    echo "$names_to_delete" | while IFS= read -r del_name; do
+        [ -z "$del_name" ] && continue
+        target="/Applications/${del_name}.app"
+        if [ -e "$target" ]; then
+            chflags nouchg "$target" 2>/dev/null
+            chflags nohidden "$target" 2>/dev/null
+            rm -f "$target" 2>/dev/null
+        fi
+    done
+    chflags noschg "$PENDING_REMOVAL_APP_FILE" 2>/dev/null
+    rm -f "$PENDING_REMOVAL_APP_FILE"
+    echo "Removed: $name"
+}
+
+cmd_ban_remove() {
+    require_root
+    _consume_confirmed_args "$@"
+    local name="$CONFIRMED_ARG"
+    if [ -z "$name" ]; then
+        echo "Usage: blockdown app remove [--confirmed] <app-name>"
+        exit 1
+    fi
+    name="${name%.app}"
+
+    local names canonical
+    names=$(read_banned_names)
+    canonical=$(_banned_find "$name" "$names") || {
+        echo "Not in banned list: $name"
+        exit 1
+    }
+    name="$canonical"
+
+    if skip_removal_cooldown; then
+        _ban_remove_now "$name"
+        exit 0
+    fi
+
+    local parsed
+    parsed=$(parse_pending_file "$PENDING_REMOVAL_APP_FILE")
+    if [ -n "$parsed" ]; then
+        local pending_name pending_time pending_ticks now remaining
+        pending_name=$(printf '%s' "$parsed" | cut -f1)
+        pending_time=$(printf '%s' "$parsed" | cut -f2)
+        pending_ticks=$(printf '%s' "$parsed" | cut -f3)
+        now=$(date +%s)
+        remaining=$(( pending_time + REMOVAL_COOLDOWN_SECONDS - now ))
+
+        if [ "$pending_name" = "$name" ]; then
+            if removal_ready "$pending_time" "$pending_ticks"; then
+                _ban_remove_now "$name"
+                exit 0
+            elif [ $remaining -gt 0 ]; then
+                local hours minutes
+                hours=$(( remaining / 3600 ))
+                minutes=$(( (remaining % 3600) / 60 ))
+                echo "Removal of '$name' is pending."
+                echo "Time remaining: ${hours}h ${minutes}m"
+                exit 0
+            else
+                # Item C: wall-clock elapsed but powered-on ticks have not.
+                echo "Removal of '$name' is pending."
+                echo "Powered-on time still accruing. Keep the Mac on and try again later."
+                exit 0
+            fi
+        else
+            echo "A different app removal is already pending: $pending_name"
+            echo "Run 'sudo blockdown app cancel' first if you want to switch."
+            exit 1
+        fi
+    elif [ -f "$PENDING_REMOVAL_APP_FILE" ]; then
+        echo "Pending-removal state file is corrupt. Run 'sudo blockdown app cancel' first."
+        exit 1
+    fi
+
+    chflags noschg "$PENDING_REMOVAL_APP_FILE" 2>/dev/null
+    echo "$name" > "$PENDING_REMOVAL_APP_FILE"
+    date +%s >> "$PENDING_REMOVAL_APP_FILE"
+    read_ticks >> "$PENDING_REMOVAL_APP_FILE"
+    chmod 644 "$PENDING_REMOVAL_APP_FILE"
+    chflags schg "$PENDING_REMOVAL_APP_FILE" 2>/dev/null
+    echo "Removal scheduled for '$name'."
+    echo "Wait 24 hours, then run 'sudo blockdown app remove $name' again to complete."
+}
+
+cmd_ban_cancel() {
+    require_root
+    if [ -f "$PENDING_REMOVAL_APP_FILE" ]; then
+        chflags noschg "$PENDING_REMOVAL_APP_FILE" 2>/dev/null
+        rm -f "$PENDING_REMOVAL_APP_FILE"
+        echo "Pending app removal cancelled."
+    else
+        echo "No pending app removal."
+    fi
+}
+
+cmd_ban_apply() {
+    require_root
+    apply_app_blocks
+    echo "App blocks reapplied."
+}
+
+# Recovery helper: drop stale bundle-ID kill entries left after an unblock.
+cmd_ban_fix_bundles() {
+    require_root
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: blockdown app fix-bundles <app-name>"
+        exit 1
+    fi
+    name="${name%.app}"
+    remove_unblocked_bundle_ids "$name" "$(read_banned_names)"
+    echo "Bundle-ID kill entries reconciled for: $name"
+}
+
+cmd_ban_status() {
+    echo "Banned apps:"
+    cmd_ban_list | sed 's/^/  /'
+    echo ""
+    local parsed
+    parsed=$(parse_pending_file "$PENDING_REMOVAL_APP_FILE")
+    if [ -n "$parsed" ]; then
+        local pending_name pending_time pending_ticks now remaining hours minutes
+        pending_name=$(printf '%s' "$parsed" | cut -f1)
+        pending_time=$(printf '%s' "$parsed" | cut -f2)
+        pending_ticks=$(printf '%s' "$parsed" | cut -f3)
+        now=$(date +%s)
+        remaining=$(( pending_time + REMOVAL_COOLDOWN_SECONDS - now ))
+        if removal_ready "$pending_time" "$pending_ticks"; then
+            echo "Pending removal of '$pending_name' is ready."
+        elif [ $remaining -gt 0 ]; then
+            hours=$(( remaining / 3600 ))
+            minutes=$(( (remaining % 3600) / 60 ))
+            echo "Pending removal: $pending_name (${hours}h ${minutes}m remaining)"
+        else
+            echo "Pending removal: $pending_name (powered-on time still accruing)"
+        fi
+    elif [ -f "$PENDING_REMOVAL_APP_FILE" ]; then
+        echo "Pending-removal state file is corrupt."
+    else
+        echo "No pending app removals."
+    fi
+}
+
+# --- Host CLI (Layer 1) ---
+
+cmd_host_add() {
+    require_root
+    local domain="$1"
+    if [ -z "$domain" ]; then
+        echo "Usage: blockdown host add <domain>"
+        exit 1
+    fi
+    if ! validate_domain "$domain"; then
+        echo "Invalid domain: $domain"
+        echo "Use a bare domain like 'example.com' (no scheme, no path)."
+        exit 1
+    fi
+
+    local domains_to_add=("$domain")
+    if [[ ! "$domain" =~ ^www\. ]]; then
+        domains_to_add+=("www.$domain")
+    fi
+
+    local state
+    state=$(read_hosts_state)
+    local added_any=0
+
+    for d in "${domains_to_add[@]}"; do
+        if [ -n "$state" ] && echo "$state" | grep -Fxq "$d"; then
+            echo "Already blocked: $d"
+        else
+            if [ -z "$state" ]; then
+                state="$d"
+            else
+                state="$state
+$d"
+            fi
+            added_any=1
+        fi
+    done
+
+    if [ "$added_any" -eq 1 ]; then
+        write_hosts_state "$state"
+        apply_hosts
+        echo "Added: $domain"
+        echo "Takes effect immediately in most apps; browsers may cache for ~60s."
+    fi
+}
+
+cmd_host_list() {
+    local blocked
+    blocked=$(list_managed_hosts)
+    if [ -z "$blocked" ]; then
+        echo "No hosts blocked."
+    else
+        echo "$blocked"
+    fi
+}
+
+_host_remove_now() {
+    local domain="$1"
+    local canonical new_state
+
+    canonical=$(_host_canonical "$domain")
+    new_state=$(read_hosts_state | grep -Fxv "$canonical" || true)
+    if [[ "$canonical" != "$domain" ]]; then
+        new_state=$(echo "$new_state" | grep -Fxv "$domain" || true)
+    fi
+    new_state=$(echo "$new_state" | grep -Fxv "www.${canonical}" || true)
+
+    write_hosts_state "$new_state"
+    apply_hosts
+
+    if is_host_blocked "$canonical"; then
+        echo "Failed to remove: $canonical"
+        exit 1
+    fi
+
+    chflags noschg "$PENDING_REMOVAL_HOST_FILE" 2>/dev/null
+    rm -f "$PENDING_REMOVAL_HOST_FILE"
+    echo "Removed: $canonical"
+    if [[ ! "$domain" =~ ^www\. ]]; then
+        echo "Removed: www.${canonical}"
+    fi
+}
+
+cmd_host_remove() {
+    require_root
+    _consume_confirmed_args "$@"
+    local domain="$CONFIRMED_ARG"
+    if [ -z "$domain" ]; then
+        echo "Usage: blockdown host remove [--confirmed] <domain>"
+        exit 1
+    fi
+
+    if ! is_host_blocked "$domain"; then
+        echo "Not blocked: $domain"
+        exit 1
+    fi
+
+    if skip_removal_cooldown; then
+        _host_remove_now "$domain"
+        exit 0
+    fi
+
+    local parsed
+    parsed=$(parse_pending_file "$PENDING_REMOVAL_HOST_FILE")
+    if [ -n "$parsed" ]; then
+        local pending_domain pending_time pending_ticks now remaining
+        pending_domain=$(printf '%s' "$parsed" | cut -f1)
+        pending_time=$(printf '%s' "$parsed" | cut -f2)
+        pending_ticks=$(printf '%s' "$parsed" | cut -f3)
+        now=$(date +%s)
+        remaining=$(( pending_time + REMOVAL_COOLDOWN_SECONDS - now ))
+
+        if [ "$pending_domain" = "$domain" ]; then
+            if removal_ready "$pending_time" "$pending_ticks"; then
+                _host_remove_now "$domain"
+                exit 0
+            elif [ $remaining -gt 0 ]; then
+                local hours minutes
+                hours=$(( remaining / 3600 ))
+                minutes=$(( (remaining % 3600) / 60 ))
+                echo "Removal of '$domain' is pending."
+                echo "Time remaining: ${hours}h ${minutes}m"
+                exit 0
+            else
+                # Item C: wall-clock elapsed but powered-on ticks have not.
+                echo "Removal of '$domain' is pending."
+                echo "Powered-on time still accruing. Keep the Mac on and try again later."
+                exit 0
+            fi
+        else
+            echo "A different host removal is already pending: $pending_domain"
+            echo "Run 'sudo blockdown host cancel' first if you want to switch."
+            exit 1
+        fi
+    elif [ -f "$PENDING_REMOVAL_HOST_FILE" ]; then
+        echo "Pending-removal state file is corrupt. Run 'sudo blockdown host cancel' first."
+        exit 1
+    fi
+
+    chflags noschg "$PENDING_REMOVAL_HOST_FILE" 2>/dev/null
+    echo "$domain" > "$PENDING_REMOVAL_HOST_FILE"
+    date +%s >> "$PENDING_REMOVAL_HOST_FILE"
+    read_ticks >> "$PENDING_REMOVAL_HOST_FILE"
+    chmod 644 "$PENDING_REMOVAL_HOST_FILE"
+    chflags schg "$PENDING_REMOVAL_HOST_FILE" 2>/dev/null
+    echo "Removal scheduled for '$domain'."
+    echo "Wait 24 hours, then run 'sudo blockdown host remove $domain' again to complete."
+}
+
+cmd_host_cancel() {
+    require_root
+    if [ -f "$PENDING_REMOVAL_HOST_FILE" ]; then
+        chflags noschg "$PENDING_REMOVAL_HOST_FILE" 2>/dev/null
+        rm -f "$PENDING_REMOVAL_HOST_FILE"
+        echo "Pending host removal cancelled."
+    else
+        echo "No pending host removal."
+    fi
+}
+
+cmd_host_status() {
+    echo "Blocked hosts:"
+    cmd_host_list | sed 's/^/  /'
+    echo ""
+    local parsed
+    parsed=$(parse_pending_file "$PENDING_REMOVAL_HOST_FILE")
+    if [ -n "$parsed" ]; then
+        local pending_domain pending_time pending_ticks now remaining hours minutes
+        pending_domain=$(printf '%s' "$parsed" | cut -f1)
+        pending_time=$(printf '%s' "$parsed" | cut -f2)
+        pending_ticks=$(printf '%s' "$parsed" | cut -f3)
+        now=$(date +%s)
+        remaining=$(( pending_time + REMOVAL_COOLDOWN_SECONDS - now ))
+        if removal_ready "$pending_time" "$pending_ticks"; then
+            echo "Pending removal of '$pending_domain' is ready."
+        elif [ $remaining -gt 0 ]; then
+            hours=$(( remaining / 3600 ))
+            minutes=$(( (remaining % 3600) / 60 ))
+            echo "Pending removal: $pending_domain (${hours}h ${minutes}m remaining)"
+        else
+            echo "Pending removal: $pending_domain (powered-on time still accruing)"
+        fi
+    elif [ -f "$PENDING_REMOVAL_HOST_FILE" ]; then
+        echo "Pending-removal state file is corrupt."
+    else
+        echo "No pending host removals."
+    fi
+}
+
+case "$1" in
+    apply)  cmd_apply ;;
+    policies)
+        shift
+        case "$1" in
+            remove) cmd_policies_remove ;;
+            enable) cmd_policies_enable ;;
+            *)
+                echo "Usage: blockdown policies {remove|enable}"
+                exit 1 ;;
+        esac ;;
+    ban)
+        shift
+        case "$1" in
+            add)    shift; cmd_ban_add "$@" ;;
+            remove) shift; cmd_ban_remove "$@" ;;
+            list)   cmd_ban_list ;;
+            status) cmd_ban_status ;;
+            cancel) cmd_ban_cancel ;;
+            apply)  cmd_ban_apply ;;
+            fix-bundles) shift; cmd_ban_fix_bundles "$@" ;;
+            *)
+                echo "Usage: blockdown app {add|remove|list|status|cancel|apply|fix-bundles} [app-name...]"
+                exit 1 ;;
+        esac ;;
+    host)
+        shift
+        case "$1" in
+            add)    shift; cmd_host_add "$1" ;;
+            remove) shift; cmd_host_remove "$@" ;;
+            list)   cmd_host_list ;;
+            status) cmd_host_status ;;
+            cancel) cmd_host_cancel ;;
+            *)
+                echo "Usage: blockdown host {add|remove|list|status|cancel} [domain]"
+                exit 1 ;;
+        esac ;;
+    *)
+        echo "Usage: blockdown apply"
+        echo "       blockdown host {add|remove|list|status|cancel} [domain]"
+        echo "       blockdown app {add|remove|list|status|cancel|apply} [app-name...]"
+        exit 1
+        ;;
+esac

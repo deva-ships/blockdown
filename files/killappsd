@@ -1,0 +1,227 @@
+#!/bin/bash
+# Kill daemon for the `ban` system. Runs every 10s under com.apple.appblockerd.
+# Reads banned-processes.list (maintained by mdsyncd's apply_app_blocks) and:
+#   0. Reconcile: converge all derived state to the banned-names list. Sweeps
+#      orphaned 0-byte *.app placeholders and prunes bundle IDs no longer backed
+#      by a banned name. This is what makes unblock reliable and self-healing:
+#      a straggler from any source is gone within one tick, and transient races
+#      self-correct on the next tick instead of persisting forever.
+#   1. Kills any matching process regardless of launch path (path-substring match).
+#   2. Kills any running app whose bundle ID is in banned-bundle-ids.list
+#      (catches renamed/suffixed copies like "Opera (1).app" or "Foo.app").
+#   3. Harvests bundle IDs for currently-banned downloaded apps.
+#
+# No placeholder files are ever created (kill-on-launch is the enforcement).
+
+PROC_LIST="/Library/Application Support/.cache/banned-processes.list"
+BUNDLE_LIST="/Library/Application Support/.cache/banned-bundle-ids.list"
+BUNDLE_PROVENANCE="/Library/Application Support/.cache/banned-bundle-provenance.list"
+
+# Item 0 — testing marker (checked inline here; lib-supervise.sh may not exist yet).
+BD_TESTING_MARKER="/Library/Application Support/.cache/.bd-testing"
+# Blockdown edition marker (no lock-in). Present = no removal-resistance: the
+# kill loop still runs, but schg locking is skipped so the bundle/tick state
+# stays editable.
+BD_EDITION_MARKER="/Library/Application Support/.cache/.bd-edition"
+bd_is_lite() { [ -f "$BD_EDITION_MARKER" ] && [ "$(cat "$BD_EDITION_MARKER" 2>/dev/null)" = "lite" ]; }
+# Item C — powered-on-time tick counter (schg-locked). ~8640 ticks × 10s = 24h.
+UPTIME_TICKS_FILE="/Library/Application Support/.cache/.uptime-ticks"
+LIB_SUPERVISE="/Library/PrivilegedHelperTools/com.apple.mdsyncd/bin/lib-supervise.sh"
+
+# Item A — bundle-list immutability helpers (the harvest pass appends to a schg-locked file).
+bundle_list_unlock() { chflags noschg "$BUNDLE_LIST" 2>/dev/null; }
+bundle_list_lock()   { bd_is_lite && return 0; chflags schg "$BUNDLE_LIST" 2>/dev/null; }
+provenance_unlock()  { chflags noschg "$BUNDLE_PROVENANCE" 2>/dev/null; }
+provenance_lock()    { bd_is_lite && return 0; chflags schg "$BUNDLE_PROVENANCE" 2>/dev/null; }
+
+_is_real_app_bundle() {
+    local app_path="$1"
+    [ -d "$app_path/Contents" ] || return 1
+    [ -f "$app_path" ] && [ ! -s "$app_path" ] && return 1
+    return 0
+}
+
+# ---------- Item B: cyclic supervision (fast restorer, runs first) ----------
+# Every 10s tick restores any missing/booted-out Layer 1–4 daemon from backup.
+# No-op while the testing marker is present (handled inside supervise_all).
+if [ -f "$LIB_SUPERVISE" ]; then
+    # shellcheck source=/dev/null
+    . "$LIB_SUPERVISE"
+    type supervise_all >/dev/null 2>&1 && supervise_all
+fi
+
+# ---------- Item C: increment powered-on tick counter ----------
+# Increments every tick — including in testing mode — so the counter always
+# reflects real powered-on time. The removal gate that reads it is what
+# skip_removal_cooldown bypasses during testing (not the counter itself).
+increment_uptime_ticks() {
+    local current
+    current=$(head -n 1 "$UPTIME_TICKS_FILE" 2>/dev/null)
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    chflags noschg "$UPTIME_TICKS_FILE" 2>/dev/null
+    echo $(( current + 1 )) > "$UPTIME_TICKS_FILE" 2>/dev/null
+    chmod 644 "$UPTIME_TICKS_FILE" 2>/dev/null
+    bd_is_lite || chflags schg "$UPTIME_TICKS_FILE" 2>/dev/null
+}
+increment_uptime_ticks
+
+# ---------- Pass 0: reconcile derived state to the banned-names list ----------
+# PROC_LIST is the derived desired-state: mdsyncd's apply_app_blocks rewrites it
+# atomically (via tmp + mv) on every add/remove, so it always reflects exactly
+# the currently-banned name variants (empty when nothing is banned).
+#
+# FAIL-SAFE: if PROC_LIST is *missing* we cannot know the desired state, so we
+# skip pruning this tick rather than risk mass-removing live blocks on a bad
+# read. A present-but-empty PROC_LIST legitimately means "nothing banned" and
+# correctly prunes everything. This one guard is the whole safety story.
+reconcile_derived_state() {
+    [ -f "$PROC_LIST" ] || return 0
+
+    # Desired base-names = the variant names in PROC_LIST (strip the app suffix).
+    local desired_names
+    desired_names=$(sed 's/\.app\/Contents\/MacOS$//' "$PROC_LIST" 2>/dev/null | awk 'NF')
+
+    # (a) Sweep placeholder litter. Nothing creates placeholders anymore, so any
+    # 0-byte *.app under /Applications is by definition an orphan from an older
+    # version. Real apps are directories, so this can never touch them.
+    local ph
+    while IFS= read -r ph; do
+        [ -z "$ph" ] && continue
+        chflags nouchg,nohidden "$ph" 2>/dev/null
+        rm -f "$ph" 2>/dev/null
+    done < <(find /Applications -maxdepth 1 -type f -name "*.app" -empty 2>/dev/null)
+
+    # (b) Prune bundle IDs no longer backed by a banned name. On this install the
+    # live list is harvest-only, so every ID has >=1 provenance row; an ID keeps
+    # its slot iff a provenance row ties it to a still-desired name. (Any future
+    # static/permanent bundle blocks would need their own list this pass ignores.)
+    [ -f "$BUNDLE_LIST" ] || return 0
+
+    local keep_ids=""
+    if [ -f "$BUNDLE_PROVENANCE" ] && [ -n "$desired_names" ]; then
+        keep_ids=$(awk -F'|' 'NR==FNR{d[$0]=1; next} ($1 in d){print $2}' \
+            <(printf '%s\n' "$desired_names") "$BUNDLE_PROVENANCE" 2>/dev/null \
+            | awk 'NF' | sort -u)
+    fi
+
+    local current new_list bid changed=0
+    current=$(cat "$BUNDLE_LIST" 2>/dev/null)
+    new_list=""
+    while IFS= read -r bid; do
+        [ -z "$bid" ] && continue
+        if [ -n "$keep_ids" ] && printf '%s\n' "$keep_ids" | grep -qxF "$bid"; then
+            new_list="${new_list}${bid}
+"
+        else
+            changed=1
+        fi
+    done <<< "$current"
+
+    [ "$changed" -eq 0 ] && return 0   # nothing stale — don't churn the schg lock
+
+    new_list=$(printf '%s' "$new_list" | awk 'NF')
+    bundle_list_unlock
+    if [ -n "$new_list" ]; then
+        printf '%s\n' "$new_list" > "$BUNDLE_LIST" 2>/dev/null
+    else
+        : > "$BUNDLE_LIST" 2>/dev/null
+    fi
+    chmod 644 "$BUNDLE_LIST" 2>/dev/null
+    bundle_list_lock
+
+    # Keep provenance in sync: drop rows whose bundle ID is no longer in the list.
+    if [ -f "$BUNDLE_PROVENANCE" ]; then
+        provenance_unlock
+        if awk -F'|' 'NR==FNR{k[$0]=1; next} ($2 in k){print}' \
+            <(printf '%s\n' "$new_list") "$BUNDLE_PROVENANCE" > "${BUNDLE_PROVENANCE}.tmp" 2>/dev/null; then
+            mv -f "${BUNDLE_PROVENANCE}.tmp" "$BUNDLE_PROVENANCE" 2>/dev/null
+        fi
+        rm -f "${BUNDLE_PROVENANCE}.tmp" 2>/dev/null
+        chmod 644 "$BUNDLE_PROVENANCE" 2>/dev/null
+        provenance_lock
+    fi
+}
+reconcile_derived_state
+
+# ---------- Pass 1 & 2: path-substring match and bundle-ID match ----------
+# Catches both "<Name>.app/Contents/MacOS" and macOS auto-suffixed copies
+# like "<Name> (1).app/Contents/MacOS", as well as renamed copies via bundle ID.
+regex=""
+if [ -f "$PROC_LIST" ]; then
+    # Escape regex special characters in app names, then join with |
+    regex=$(sed 's/\.app\/Contents\/MacOS$//' "$PROC_LIST" | sed 's/[.[\*^$]/\\&/g' | paste -sd '|' -)
+fi
+
+for pid in $(pgrep -f "/Contents/MacOS/"); do
+    exe=$(ps -p "$pid" -o comm= 2>/dev/null)
+    [ -z "$exe" ] && continue
+    
+    # Check Pass 1 (path match)
+    if [ -n "$regex" ] && echo "$exe" | grep -qiE "(${regex})( \([0-9]+\))?\.app/Contents/MacOS"; then
+        kill -9 "$pid" 2>/dev/null
+        continue
+    fi
+    
+    # Check Pass 2 (bundle ID match)
+    if [ -f "$BUNDLE_LIST" ]; then
+        bundle_path="${exe%/Contents/MacOS/*}"
+        [ -d "$bundle_path" ] || continue
+        bid=$(defaults read "$bundle_path/Contents/Info" CFBundleIdentifier 2>/dev/null)
+        [ -z "$bid" ] && continue
+        if grep -qxF "$bid" "$BUNDLE_LIST" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null
+        fi
+    fi
+done
+
+# ---------- Pass 3: Harvest Bundle IDs from downloaded banned apps ----------
+if [ -f "$PROC_LIST" ]; then
+    while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        
+        base_name="${pattern%.app/Contents/MacOS}"
+        
+        # Use Spotlight first, then find as a root-safe fallback.
+        found_apps=$(mdfind "kMDItemFSName == '${base_name}*.app'cd && kMDItemContentType == 'com.apple.application-bundle'" 2>/dev/null)
+        if [ -z "$found_apps" ]; then
+            found_apps=$(find /Applications /Users/*/Applications /Users/*/Desktop /Users/*/Documents /Users/*/Downloads \
+                -maxdepth 5 -type d -name "${base_name}*.app" 2>/dev/null)
+        fi
+        
+        if [ -n "$found_apps" ]; then
+            echo "$found_apps" | while IFS= read -r app_path; do
+                plist_path="$app_path/Contents/Info.plist"
+                _is_real_app_bundle "$app_path" || continue
+                if [ -f "$plist_path" ]; then
+                    # Extract the Bundle ID
+                    bid=$(defaults read "${plist_path%.plist}" CFBundleIdentifier 2>/dev/null)
+                    
+                    if [ -n "$bid" ]; then
+                        # Always record provenance so unblock knows this ID is tied to this name
+                        provenance_unlock
+                        touch "$BUNDLE_PROVENANCE" 2>/dev/null
+                        if ! grep -qxF "${base_name}|${bid}" "$BUNDLE_PROVENANCE" 2>/dev/null; then
+                            echo "${base_name}|${bid}" >> "$BUNDLE_PROVENANCE"
+                        fi
+                        chmod 644 "$BUNDLE_PROVENANCE" 2>/dev/null
+                        provenance_lock
+
+                        # Item A: BUNDLE_LIST is schg-locked; unlock to append, then relock.
+                        bundle_list_unlock
+                        # Ensure BUNDLE_LIST exists
+                        touch "$BUNDLE_LIST" 2>/dev/null
+
+                        # Append it if we haven't harvested it yet
+                        if ! grep -qxF "$bid" "$BUNDLE_LIST" 2>/dev/null; then
+                            echo "$bid" >> "$BUNDLE_LIST"
+                        fi
+                        chmod 644 "$BUNDLE_LIST" 2>/dev/null
+                        bundle_list_lock
+                    fi
+                fi
+            done
+        fi
+    done < "$PROC_LIST"
+fi
+
+exit 0

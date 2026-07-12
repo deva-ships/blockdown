@@ -1,0 +1,79 @@
+#!/bin/bash
+# statsd — secondary restorer in the Blockdown supervision cycle (Item B).
+#
+# Its LaunchDaemon watches the helper bin dir + /Library/LaunchDaemons, so a
+# deletion of mdsyncd or lib-supervise.sh triggers it immediately. It inline-
+# restores the two files the rest of the cycle depends on (mdsyncd worker +
+# lib-supervise.sh) so the cycle can always be re-primed even if lib-supervise
+# is gone, then hands off to supervise_all for full Layer 1–4 coverage.
+
+CACHE="/Library/Application Support/.cache"
+HELPER_BIN="/Library/PrivilegedHelperTools/com.apple.mdsyncd/bin"
+LIB_SUPERVISE="${HELPER_BIN}/lib-supervise.sh"
+
+# Item 0 — testing marker. Present = recoverable testing mode: pause ALL of statsd,
+# not just supervise_all. The inline prime-the-cycle block below re-locks (schg) and
+# re-bootstraps mdsyncd, so it must also honor the marker or it fights the installer
+# during a layer reinstall (and the Part 2 gated teardown) — the exact thrash the
+# marker exists to prevent.
+BD_TESTING_MARKER="${CACHE}/.bd-testing"
+# Blockdown edition marker (no lock-in). Present = the self-heal layer was never
+# installed, so statsd stands down entirely (same as under the testing marker).
+BD_EDITION_MARKER="${CACHE}/.bd-edition"
+bd_is_lite() { [ -f "$BD_EDITION_MARKER" ] && [ "$(cat "$BD_EDITION_MARKER" 2>/dev/null)" = "lite" ]; }
+{ [ -f "$BD_TESTING_MARKER" ] || bd_is_lite; } && exit 0
+LIB_SUPERVISE_BACKUP="${CACHE}/lib-supervise.sh.backup"
+
+PRIMARY_PLIST="/Library/LaunchDaemons/com.apple.mdsyncd.plist"
+PRIMARY_BACKUP="${CACHE}/mdsyncd.plist.backup"
+PRIMARY_WORKER="${HELPER_BIN}/mdsyncd"
+WORKER_BACKUP="${CACHE}/mdsyncd.backup"
+
+# Sanity-check backups before trusting them. A corrupt backup would produce a
+# non-functional daemon that keeps reloading; better to skip the restore and let
+# the (tampered) missing state stay visible than to loop on a broken binary.
+script_backup_valid() {
+    [ -s "$1" ] || return 1
+    bash -n "$1" 2>/dev/null
+}
+plist_backup_valid() {
+    [ -s "$1" ] || return 1
+    plutil -lint "$1" >/dev/null 2>&1
+}
+
+# --- Prime the cycle: restore mdsyncd plist + worker + lib-supervise if missing. ---
+if [ ! -f "$PRIMARY_PLIST" ] && plist_backup_valid "$PRIMARY_BACKUP"; then
+    cp "$PRIMARY_BACKUP" "$PRIMARY_PLIST"
+    chown root:wheel "$PRIMARY_PLIST"
+    chmod 644 "$PRIMARY_PLIST"
+    chflags schg "$PRIMARY_PLIST" 2>/dev/null
+    launchctl bootstrap system "$PRIMARY_PLIST" 2>/dev/null || launchctl load "$PRIMARY_PLIST" 2>/dev/null
+fi
+
+if [ ! -f "$PRIMARY_WORKER" ] && script_backup_valid "$WORKER_BACKUP"; then
+    cp "$WORKER_BACKUP" "$PRIMARY_WORKER"
+    chown root:wheel "$PRIMARY_WORKER"
+    chmod 755 "$PRIMARY_WORKER"
+    chflags schg "$PRIMARY_WORKER" 2>/dev/null
+fi
+
+if [ ! -f "$LIB_SUPERVISE" ] && script_backup_valid "$LIB_SUPERVISE_BACKUP"; then
+    cp "$LIB_SUPERVISE_BACKUP" "$LIB_SUPERVISE"
+    chown root:wheel "$LIB_SUPERVISE"
+    chmod 644 "$LIB_SUPERVISE"
+    chflags schg "$LIB_SUPERVISE" 2>/dev/null
+fi
+
+# Ensure the primary daemon is loaded (in case it was booted out but the file remains).
+if [ -f "$PRIMARY_PLIST" ] && ! launchctl print system/com.apple.mdsyncd >/dev/null 2>&1; then
+    launchctl bootstrap system "$PRIMARY_PLIST" 2>/dev/null || launchctl load "$PRIMARY_PLIST" 2>/dev/null
+fi
+
+# --- Hand off to full cyclic supervision (no-op while the testing marker is present). ---
+if [ -f "$LIB_SUPERVISE" ]; then
+    # shellcheck source=/dev/null
+    . "$LIB_SUPERVISE"
+    type supervise_all >/dev/null 2>&1 && supervise_all
+fi
+
+exit 0

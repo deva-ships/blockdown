@@ -1,0 +1,150 @@
+# =========================================================
+# PART A: Allow port 53 ONLY to CleanBrowsing; block everything else
+# =========================================================
+# macOS PF's `rdr` rules only translate packets ARRIVING ON an interface, not
+# packets ORIGINATING from this Mac. Redirecting local outgoing DNS queries
+# would require divert(4) or a transparent proxy (out of scope).
+#
+# Instead, we use simple block/pass rules:
+#   - Allow port 53 to CleanBrowsing's IPs (for apps that explicitly target them)
+#   - Block all other port 53 traffic
+#
+# Legitimate DNS goes through the system resolver on port 443 (DoH via the
+# CleanBrowsing profile), so blocking port 53 to other servers doesn't break
+# normal traffic — it only catches apps trying to bypass the system resolver.
+
+pass out quick inet proto { tcp, udp } from any to { 185.228.168.10, 185.228.169.11 } port 53
+block drop quick inet proto { tcp, udp } from any to any port 53
+
+# =========================================================
+# PART A2: Block all IPv6 DNS (port 53)
+# =========================================================
+# Forces IPv6-DNS-bypass apps to fall back to IPv4 (which is then blocked or
+# allowed to CleanBrowsing by Part A above).
+
+block drop quick inet6 proto { tcp, udp } from any to any port 53
+
+# =========================================================
+# PART B: Block DNS-over-TLS (port 853) globally
+# =========================================================
+
+block drop quick proto { tcp, udp } from any to any port 853
+
+# =========================================================
+# PART C: Block DNS-over-HTTPS (port 443, TCP + UDP/QUIC) to
+# all known DoH server IPs.
+# UDP is included to block QUIC/HTTP3-based DoH bypass.
+# =========================================================
+
+# --- Cloudflare ---
+block drop quick proto { tcp, udp } from any to { 1.0.0.1, 1.0.0.2, 1.0.0.3, 1.1.1.1, 1.1.1.2, 1.1.1.3 } port 443
+block drop quick proto { tcp, udp } from any to { 104.16.132.229, 104.16.133.229, 104.16.248.249, 104.16.249.249 } port 443
+block drop quick proto { tcp, udp } from any to { 162.159.61.3, 162.159.61.4, 172.64.41.3, 172.64.41.4 } port 443
+
+# --- Google ---
+block drop quick proto { tcp, udp } from any to { 8.8.4.4, 8.8.8.8 } port 443
+
+# --- Quad9 ---
+block drop quick proto { tcp, udp } from any to { 9.9.9.9, 9.9.9.10, 9.9.9.11, 149.112.112.9, 149.112.112.10 } port 443
+block drop quick proto { tcp, udp } from any to { 149.112.112.11, 149.112.112.112, 149.112.121.10, 149.112.121.20 } port 443
+block drop quick proto { tcp, udp } from any to { 149.112.121.30, 149.112.122.10, 149.112.122.20, 149.112.122.30 } port 443
+
+# --- OpenDNS / Cisco Umbrella ---
+block drop quick proto { tcp, udp } from any to { 208.67.220.123, 208.67.220.220, 208.67.222.123, 208.67.222.222 } port 443
+block drop quick proto { tcp, udp } from any to { 146.112.41.2, 146.112.41.3, 146.112.41.4 } port 443
+
+# --- AdGuard ---
+block drop quick proto { tcp, udp } from any to { 94.140.14.14, 94.140.14.15, 94.140.14.140, 94.140.14.141 } port 443
+block drop quick proto { tcp, udp } from any to { 94.140.15.15, 94.140.15.16 } port 443
+
+# --- NextDNS / Control D / Mullvad ---
+block drop quick proto { tcp, udp } from any to { 45.90.28.0/24, 45.90.30.0/24 } port 443
+block drop quick proto { tcp, udp } from any to { 76.76.2.11, 76.76.21.93, 76.76.21.123 } port 443
+
+# --- Apple Private Relay / iCloud DoH ---
+block drop quick proto { tcp, udp } from any to { 17.253.84.119, 17.253.84.247, 17.253.86.129, 17.253.86.131 } port 443
+
+# --- Alibaba DNS ---
+block drop quick proto { tcp, udp } from any to { 223.5.5.5, 223.6.6.6 } port 443
+
+# --- Taiwan / Asia DNS ---
+block drop quick proto { tcp, udp } from any to { 101.101.101.101, 101.198.191.4, 101.198.192.33, 101.198.193.29 } port 443
+
+# --- Comodo / Neustar ---
+block drop quick proto { tcp, udp } from any to { 8.20.247.20, 8.26.56.26, 156.154.70.1, 156.154.71.1 } port 443
+
+# --- CleanBrowsing (block direct-IP DoH to non-active filter endpoints) ---
+block drop quick proto { tcp, udp } from any to { 185.228.168.168, 185.228.169.168, 185.228.168.9, 185.228.169.9 } port 443
+
+# --- dns.sb ---
+block drop quick proto { tcp, udp } from any to { 185.222.222.222, 45.11.45.11 } port 443
+
+# --- LibreDNS / Dismail ---
+block drop quick proto { tcp, udp } from any to { 116.202.176.26, 116.202.233.144 } port 443
+
+# --- Blahdns ---
+block drop quick proto { tcp, udp } from any to { 45.91.92.121, 78.46.244.143, 78.47.163.141, 78.47.212.211 } port 443
+block drop quick proto { tcp, udp } from any to { 95.216.212.177, 159.69.114.157 } port 443
+
+# --- CIRA Canadian Shield ---
+block drop quick proto { tcp, udp } from any to { 149.56.228.45, 167.114.220.125 } port 443
+
+# --- Digitale Gesellschaft (Swiss) ---
+block drop quick proto { tcp, udp } from any to { 130.59.31.248, 130.59.31.251 } port 443
+
+# --- AhaDNS ---
+block drop quick proto { tcp, udp } from any to { 5.2.75.75, 45.67.219.208 } port 443
+
+# --- Pi-DNS ---
+block drop quick proto { tcp, udp } from any to { 88.198.91.187, 95.216.181.228, 95.217.25.217 } port 443
+
+# --- DNSWarden ---
+block drop quick proto { tcp, udp } from any to { 116.203.32.217, 116.203.215.58 } port 443
+
+# --- Misc known DoH providers ---
+block drop quick proto { tcp, udp } from any to { 3.34.32.82, 5.1.66.255, 5.45.107.88, 13.89.120.251 } port 443
+block drop quick proto { tcp, udp } from any to { 40.76.112.230, 45.63.30.163, 45.76.113.31, 45.86.125.59 } port 443
+block drop quick proto { tcp, udp } from any to { 45.153.187.96, 45.155.171.163, 46.101.66.244, 46.226.108.173 } port 443
+block drop quick proto { tcp, udp } from any to { 46.226.109.82, 46.226.110.211, 46.227.200.52, 46.227.200.54 } port 443
+block drop quick proto { tcp, udp } from any to { 46.227.200.55, 46.227.203.52, 46.227.207.52, 64.78.200.1 } port 443
+block drop quick proto { tcp, udp } from any to { 64.78.201.1, 65.108.87.118, 66.42.33.135, 72.34.38.64 } port 443
+block drop quick proto { tcp, udp } from any to { 74.82.42.42, 75.75.77.99, 79.110.170.43, 80.156.145.201 } port 443
+block drop quick proto { tcp, udp } from any to { 81.187.221.24, 89.38.131.38, 89.45.227.53, 89.233.43.71 } port 443
+block drop quick proto { tcp, udp } from any to { 91.239.96.35, 91.239.100.100, 92.223.109.19 } port 443
+block drop quick proto { tcp, udp } from any to { 103.2.57.5, 103.2.57.6, 103.127.124.46, 103.167.150.45 } port 443
+block drop quick proto { tcp, udp } from any to { 104.21.33.14, 104.21.46.152, 104.21.49.234, 104.21.89.92 } port 443
+block drop quick proto { tcp, udp } from any to { 104.21.91.14, 104.26.8.190, 104.26.9.190, 104.244.78.231 } port 443
+block drop quick proto { tcp, udp } from any to { 109.70.100.134, 130.225.244.166, 130.226.161.34 } port 443
+block drop quick proto { tcp, udp } from any to { 136.144.215.158, 139.59.48.222, 141.164.35.160, 141.164.63.208 } port 443
+block drop quick proto { tcp, udp } from any to { 144.22.247.219, 145.100.185.15, 145.100.185.16, 145.100.185.17 } port 443
+block drop quick proto { tcp, udp } from any to { 145.100.185.18, 146.255.56.98, 149.248.217.117, 152.67.165.26 } port 443
+block drop quick proto { tcp, udp } from any to { 157.90.124.62, 158.64.1.29, 162.14.21.56, 162.14.21.178 } port 443
+block drop quick proto { tcp, udp } from any to { 162.55.169.60, 167.235.236.107, 172.65.135.187, 172.67.75.111 } port 443
+block drop quick proto { tcp, udp } from any to { 172.67.139.137, 172.67.139.164, 172.67.140.94, 172.67.164.149 } port 443
+block drop quick proto { tcp, udp } from any to { 172.67.195.148, 172.104.93.80, 174.68.248.77, 174.138.29.175 } port 443
+block drop quick proto { tcp, udp } from any to { 175.24.154.66, 176.9.1.117, 176.9.93.198, 184.105.193.78 } port 443
+block drop quick proto { tcp, udp } from any to { 185.38.27.139, 185.43.135.1, 185.49.141.38, 185.95.218.42 } port 443
+block drop quick proto { tcp, udp } from any to { 185.95.218.43, 185.134.196.52, 185.134.196.54, 185.134.196.55 } port 443
+block drop quick proto { tcp, udp } from any to { 185.150.99.255, 185.213.26.187 } port 443
+block drop quick proto { tcp, udp } from any to { 185.235.81.1, 185.235.81.2, 185.235.81.3, 185.235.81.4 } port 443
+block drop quick proto { tcp, udp } from any to { 185.235.81.5, 185.235.81.6, 185.235.81.81, 185.235.83.83 } port 443
+block drop quick proto { tcp, udp } from any to { 193.17.47.1, 193.148.249.126, 193.180.80.1, 193.180.80.2 } port 443
+block drop quick proto { tcp, udp } from any to { 194.242.2.2, 194.242.2.3, 198.180.150.12, 199.58.83.33 } port 443
+block drop quick proto { tcp, udp } from any to { 199.195.251.84, 200.1.123.46, 209.141.34.95, 212.52.0.233 } port 443
+block drop quick proto { tcp, udp } from any to { 213.196.191.96, 217.160.156.119, 217.169.20.22, 217.169.20.23 } port 443
+
+# =========================================================
+# PART D: Block Browser VPN / Proxy IP Ranges Globally
+# =========================================================
+# Opera VPN uses these specific subnet ranges for its proxy nodes. 
+# Blocking them at the firewall level ensures that even if Opera Air
+# completely bypasses DNS and connects directly to the IP via hardcoded 
+# arrays, the connection will time out.
+
+block drop quick proto { tcp, udp } from any to { 37.228.108.128/25, 37.228.104.0/21 } port 443
+block drop quick proto { tcp, udp } from any to { 107.167.96.0/19, 185.26.182.0/23 } port 443
+block drop quick proto { tcp, udp } from any to { 77.111.244.0/22, 82.145.208.0/20 } port 443
+block drop quick proto { tcp, udp } from any to { 91.203.96.0/22, 141.0.8.0/21 } port 443
+block drop quick proto { tcp, udp } from any to { 185.26.180.0/22, 195.189.142.0/23 } port 443
+block drop quick inet6 proto { tcp, udp } from any to { 2001:4c28::/29 } port 443
+

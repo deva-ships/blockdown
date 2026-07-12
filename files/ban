@@ -1,0 +1,10 @@
+#!/bin/bash
+# Legacy alias for blockdown app — kept for backwards compatibility.
+BLOCKDOWN="/usr/local/bin/blockdown"
+
+if [[ ! -x "$BLOCKDOWN" ]]; then
+    echo "blockdown CLI not installed. Run the Blockdown installer first." >&2
+    exit 1
+fi
+
+exec "$BLOCKDOWN" app "$@"

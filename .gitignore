@@ -1,0 +1,20 @@
+# Editor / OS cruft
+.DS_Store
+**/.DS_Store
+.cursor
+.claude/
+
+# Working-copy snapshots and stray root-owned artifacts (never publish)
+.copy-backup/
+Support/
+
+# Downloaded binaries (fetched by ./setup, not committed)
+bin/
+bin/gum
+
+# Local runtime / dry-run state
+/tmp/blockdown-dry-run
+/tmp/blockdown-dns-state-*
+
+# Self-heal backups and exported state
+*.backup

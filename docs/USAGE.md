@@ -24,7 +24,10 @@ Blockdown blocks whole domains and categories only, not individual URL paths wit
 sudo blockdown host add i.redd.it            # both 0.0.0.0 and ::1; www. added automatically
 sudo blockdown app add WhatsApp              # display name, without .app
 sudo blockdown app add Telegram Discord      # several at once
+sudo blockdown app add "Opera Air"           # quote multi-word names
 ```
+
+In the TUI (**Block apps → Block any app**), spaces separate names the same way; quote multi-word ones (`WhatsApp "Opera Air" Discord`).
 
 Blocks apply immediately: domains within seconds (a browser may cache one for about a minute), and a running blocked app is closed within 10 seconds. The kill daemon also learns the bundle IDs of installed copies, so renamed apps and re-downloads like `WhatsApp (1).app` stay blocked.
 

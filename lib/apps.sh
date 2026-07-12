@@ -120,12 +120,43 @@ _apps_add_from_device() {
     _apps_apply_block "$selected"
 }
 
+# Split typed names on spaces; "..." or '...' keep multi-word names together.
+# Prints one name per line (app display names never contain newlines).
+_apps_parse_names() {
+    local input=$1
+    local i=0
+    local len=${#input}
+    local c word="" quote=""
+
+    while ((i < len)); do
+        c=${input:i:1}
+        i=$((i + 1))
+        if [[ -n $quote ]]; then
+            if [[ $c == "$quote" ]]; then
+                quote=
+            else
+                word+=$c
+            fi
+        elif [[ $c == \" || $c == \' ]]; then
+            quote=$c
+        elif [[ $c == [[:space:]] ]]; then
+            if [[ -n $word ]]; then
+                printf '%s\n' "$word"
+                word=
+            fi
+        else
+            word+=$c
+        fi
+    done
+    [[ -n $word ]] && printf '%s\n' "$word"
+}
+
 _apps_add_by_name() {
     clear
     local input
-    input=$(ui_input "Enter app name(s) to block (e.g., WhatsApp Telegram Discord)" \
-        --hint "The name you type doesn't have to match the app exactly." \
-        --hint "If a block fails, use the exact name from Finder.")
+    input=$(ui_input "Enter app name(s) to block (e.g., WhatsApp \"Opera Air\" Discord)" \
+        --hint "Put quotes around multi-word names. If a block fails, use the" \
+        --hint "exact name from Finder.")
     input=$(echo "$input" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
     if [[ -z "$input" ]]; then
@@ -134,10 +165,16 @@ _apps_add_by_name() {
         return
     fi
 
-    local to_add=()
+    local parsed=()
     local name
+    while IFS= read -r name; do
+        [[ -z $name ]] && continue
+        parsed+=("$name")
+    done < <(_apps_parse_names "$input")
 
-    for name in $input; do
+    local to_add=()
+
+    for name in "${parsed[@]}"; do
         name=$(_apps_resolve_name "$name")
 
         if app_is_blocked "$name"; then

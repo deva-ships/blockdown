@@ -114,7 +114,7 @@ while IFS= read -r name; do
 done < $REPO/data/banned-apps.txt
 ```
 
-**Note:** blocking matches on the app's display name (plus generated variants), so review names before blocking and use the exact Finder display name for anything ambiguous.
+**Note:** blocking matches on the app's display name (plus generated variants), so review names before blocking and use the exact Finder display name for anything ambiguous. In the TUI, quote multi-word names (`"Opera Air"`); on the CLI, quote them the same way so the shell keeps them as one argument.
 
 To also block manual renames, append bundle IDs to the live list (or copy from `data/banned-bundle-ids.txt`):
 

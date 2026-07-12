@@ -2,7 +2,7 @@
 
 Screen Time for Mac, but it actually works.
 
-Blockdown blocks websites and apps across your whole Mac, in every browser and every app. The blocks hold. To remove one, you go through an unlock you set up front: a waiting period, or a key only you hold. Screen Time has the same idea, but lets you switch any limit off in two taps. That is the exact moment a limit should hold. Blockdown keeps the limits you set. Free and open source.
+You decide what your Mac will and won't open. Blockdown holds the line. Block websites, apps, and whole categories, everywhere at once: every browser, every app, even apps you haven't installed yet. Turning a block off is deliberate, never instant. You wait out a timer, or you use a key only you hold. Free and open source.
 
 ## Install
 
@@ -17,7 +17,7 @@ cd blockdown
 ./blockdown
 ```
 
-If macOS asks to install developer tools for `git`, click **Install**, wait, then paste again. Keep the `blockdown` folder — you open the app from there later.
+If macOS asks to install developer tools for `git`, click **Install**, wait for it to finish, then paste the command again. Keep the `blockdown` folder because you'll open the app from there later.
 
 In the menu you can set up an optional web filter, or preview changes with `./blockdown --dry-run`.
 

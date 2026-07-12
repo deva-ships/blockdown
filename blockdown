@@ -114,13 +114,11 @@ screen_main_menu() {
                 ;;
         esac
 
-        local dns_filter host_count app_count status_line
+        local dns_filter status_line
         dns_filter=$(_dns_filter)
-        host_count=$(host_block_count)
-        app_count=$(app_block_count)
 
         ui_logo_compact "$dry_suffix"
-        status_line="${lock_label}  ·  $(pluralize "$host_count" site)  ·  $(pluralize "$app_count" app)"
+        status_line="${lock_label}"
         if [[ -n "$dns_filter" && "$dns_filter" != "None" ]]; then
             status_line+="  ·  ${dns_filter} filter"
         fi

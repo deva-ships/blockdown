@@ -9,13 +9,16 @@
 #   1. Kills any matching process regardless of launch path (path-substring match).
 #   2. Kills any running app whose bundle ID is in banned-bundle-ids.list
 #      (catches renamed/suffixed copies like "Opera (1).app" or "Foo.app").
-#   3. Harvests bundle IDs for currently-banned downloaded apps.
+#   3. Harvests bundle IDs for currently-banned downloaded apps (background only;
+#      canonical names from bannedd.plist — not the expanded variant list).
 #
 # No placeholder files are ever created (kill-on-launch is the enforcement).
 
 PROC_LIST="/Library/Application Support/.cache/banned-processes.list"
+BANNED_CONFIG="/Library/Application Support/.cache/bannedd.plist"
 BUNDLE_LIST="/Library/Application Support/.cache/banned-bundle-ids.list"
 BUNDLE_PROVENANCE="/Library/Application Support/.cache/banned-bundle-provenance.list"
+HARVEST_LOCK="/Library/Application Support/.cache/.harvest.lock"
 
 # Item 0 — testing marker (checked inline here; lib-supervise.sh may not exist yet).
 BD_TESTING_MARKER="/Library/Application Support/.cache/.bd-testing"
@@ -39,6 +42,38 @@ _is_real_app_bundle() {
     [ -d "$app_path/Contents" ] || return 1
     [ -f "$app_path" ] && [ ! -s "$app_path" ] && return 1
     return 0
+}
+
+read_banned_names() {
+    local encoded names
+    encoded=$(/usr/libexec/PlistBuddy -c "Print :CacheValidationApps" "$BANNED_CONFIG" 2>/dev/null | tr -d ' \n')
+    [ -n "$encoded" ] || return 0
+    names=$(printf '%s' "$encoded" | base64 --decode 2>/dev/null)
+    printf '%s\n' "$names"
+}
+
+_app_search_roots() {
+    local -a search_roots=(/Applications)
+    local user_home sub
+
+    for user_home in /Users/*/; do
+        case "$(basename "${user_home%/}")" in Shared) continue ;; esac
+        for sub in Applications Desktop Documents Downloads; do
+            [ -d "${user_home}${sub}" ] && search_roots+=("${user_home}${sub}")
+        done
+    done
+
+    printf '%s\n' "${search_roots[@]}"
+}
+
+# True when exe looks like .../Name.app/Contents/MacOS/... and Name is banned.
+_exe_banned_by_path() {
+    local exe="$1" base stripped
+    [[ "$exe" == *".app/Contents/MacOS"* ]] || return 1
+    base="${exe%%.app/Contents/MacOS*}"
+    base="${base##*/}"
+    stripped="${base% \([0-9]*\)}"
+    grep -Fxi "$stripped" "$PROC_LIST_STRIPPED" >/dev/null 2>&1
 }
 
 # ---------- Item B: cyclic supervision (fast restorer, runs first) ----------
@@ -143,26 +178,26 @@ reconcile_derived_state() {
 }
 reconcile_derived_state
 
-# ---------- Pass 1 & 2: path-substring match and bundle-ID match ----------
+# ---------- Pass 1 & 2: path match and bundle-ID match ----------
 # Catches both "<Name>.app/Contents/MacOS" and macOS auto-suffixed copies
 # like "<Name> (1).app/Contents/MacOS", as well as renamed copies via bundle ID.
-regex=""
+PROC_LIST_STRIPPED=""
 if [ -f "$PROC_LIST" ]; then
-    # Escape regex special characters in app names, then join with |
-    regex=$(sed 's/\.app\/Contents\/MacOS$//' "$PROC_LIST" | sed 's/[.[\*^$]/\\&/g' | paste -sd '|' -)
+    PROC_LIST_STRIPPED=$(mktemp)
+    sed 's/\.app\/Contents\/MacOS$//' "$PROC_LIST" | awk 'NF' | sort -u > "$PROC_LIST_STRIPPED"
 fi
 
 for pid in $(pgrep -f "/Contents/MacOS/"); do
     exe=$(ps -p "$pid" -o comm= 2>/dev/null)
     [ -z "$exe" ] && continue
-    
-    # Check Pass 1 (path match)
-    if [ -n "$regex" ] && echo "$exe" | grep -qiE "(${regex})( \([0-9]+\))?\.app/Contents/MacOS"; then
+
+    # Pass 1: fixed-string match on the .app folder name (fast; no giant regex).
+    if [ -n "$PROC_LIST_STRIPPED" ] && _exe_banned_by_path "$exe"; then
         kill -9 "$pid" 2>/dev/null
         continue
     fi
-    
-    # Check Pass 2 (bundle ID match)
+
+    # Pass 2: bundle ID match
     if [ -f "$BUNDLE_LIST" ]; then
         bundle_path="${exe%/Contents/MacOS/*}"
         [ -d "$bundle_path" ] || continue
@@ -174,54 +209,55 @@ for pid in $(pgrep -f "/Contents/MacOS/"); do
     fi
 done
 
-# ---------- Pass 3: Harvest Bundle IDs from downloaded banned apps ----------
-if [ -f "$PROC_LIST" ]; then
-    while IFS= read -r pattern; do
-        [ -z "$pattern" ] && continue
-        
-        base_name="${pattern%.app/Contents/MacOS}"
-        
-        # Use Spotlight first, then find as a root-safe fallback.
-        found_apps=$(mdfind "kMDItemFSName == '${base_name}*.app'cd && kMDItemContentType == 'com.apple.application-bundle'" 2>/dev/null)
-        if [ -z "$found_apps" ]; then
-            found_apps=$(find /Applications /Users/*/Applications /Users/*/Desktop /Users/*/Documents /Users/*/Downloads \
-                -maxdepth 5 -type d -name "${base_name}*.app" 2>/dev/null)
-        fi
-        
-        if [ -n "$found_apps" ]; then
-            echo "$found_apps" | while IFS= read -r app_path; do
+[ -n "$PROC_LIST_STRIPPED" ] && rm -f "$PROC_LIST_STRIPPED"
+
+# ---------- Pass 3: Harvest bundle IDs (background; must not block the kill tick) ----------
+harvest_bundle_ids_pass() {
+    local names name base_name root app_path bid plist_path
+    names=$(read_banned_names)
+    [ -n "$names" ] || return 0
+
+    while IFS= read -r base_name; do
+        [ -z "$base_name" ] && continue
+        while IFS= read -r root; do
+            [ -d "$root" ] || continue
+            while IFS= read -r app_path; do
+                [ -z "$app_path" ] && continue
+                case "$(basename "$app_path")" in
+                    "${base_name}"*.app) ;;
+                    *) continue ;;
+                esac
                 plist_path="$app_path/Contents/Info.plist"
                 _is_real_app_bundle "$app_path" || continue
-                if [ -f "$plist_path" ]; then
-                    # Extract the Bundle ID
-                    bid=$(defaults read "${plist_path%.plist}" CFBundleIdentifier 2>/dev/null)
-                    
-                    if [ -n "$bid" ]; then
-                        # Always record provenance so unblock knows this ID is tied to this name
-                        provenance_unlock
-                        touch "$BUNDLE_PROVENANCE" 2>/dev/null
-                        if ! grep -qxF "${base_name}|${bid}" "$BUNDLE_PROVENANCE" 2>/dev/null; then
-                            echo "${base_name}|${bid}" >> "$BUNDLE_PROVENANCE"
-                        fi
-                        chmod 644 "$BUNDLE_PROVENANCE" 2>/dev/null
-                        provenance_lock
+                [ -f "$plist_path" ] || continue
+                bid=$(defaults read "${plist_path%.plist}" CFBundleIdentifier 2>/dev/null)
+                [ -n "$bid" ] || continue
 
-                        # Item A: BUNDLE_LIST is schg-locked; unlock to append, then relock.
-                        bundle_list_unlock
-                        # Ensure BUNDLE_LIST exists
-                        touch "$BUNDLE_LIST" 2>/dev/null
-
-                        # Append it if we haven't harvested it yet
-                        if ! grep -qxF "$bid" "$BUNDLE_LIST" 2>/dev/null; then
-                            echo "$bid" >> "$BUNDLE_LIST"
-                        fi
-                        chmod 644 "$BUNDLE_LIST" 2>/dev/null
-                        bundle_list_lock
-                    fi
+                provenance_unlock
+                touch "$BUNDLE_PROVENANCE" 2>/dev/null
+                if ! grep -qxF "${base_name}|${bid}" "$BUNDLE_PROVENANCE" 2>/dev/null; then
+                    echo "${base_name}|${bid}" >> "$BUNDLE_PROVENANCE"
                 fi
-            done
-        fi
-    done < "$PROC_LIST"
+                chmod 644 "$BUNDLE_PROVENANCE" 2>/dev/null
+                provenance_lock
+
+                bundle_list_unlock
+                touch "$BUNDLE_LIST" 2>/dev/null
+                if ! grep -qxF "$bid" "$BUNDLE_LIST" 2>/dev/null; then
+                    echo "$bid" >> "$BUNDLE_LIST"
+                fi
+                chmod 644 "$BUNDLE_LIST" 2>/dev/null
+                bundle_list_lock
+            done < <(find "$root" -maxdepth 5 -type d -name "${base_name}*.app" 2>/dev/null)
+        done < <(_app_search_roots)
+    done <<< "$names"
+}
+
+if [ -f "$BANNED_CONFIG" ] && mkdir "$HARVEST_LOCK" 2>/dev/null; then
+    (
+        harvest_bundle_ids_pass
+        rmdir "$HARVEST_LOCK" 2>/dev/null
+    ) &
 fi
 
 exit 0

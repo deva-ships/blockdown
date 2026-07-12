@@ -71,7 +71,9 @@ _apps_scan_installed() {
         "$HOME/Applications"
         "$HOME/Downloads"
     )
-    local dir app_path name
+    local dir app_path name blocked_list
+
+    blocked_list=$(_app_list)
 
     for dir in "${dirs[@]}"; do
         [[ -d "$dir" ]] || continue
@@ -87,7 +89,7 @@ _apps_scan_installed() {
             name="${app_path##*/}"
             name="${name%.app}"
             [[ -n "$name" ]] || continue
-            app_is_blocked "$name" && continue
+            app_is_blocked "$name" "$blocked_list" && continue
             printf '%s\n' "$name"
         done < <(find "$dir" -maxdepth 5 -type d -name "*.app" 2>/dev/null)
     done | sort -fu

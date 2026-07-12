@@ -149,14 +149,17 @@ _icase_equal() {
     [[ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ]]
 }
 
+# Optional second arg: preloaded newline-separated banned names (avoids re-querying
+# the CLI for every installed app during a device scan).
 app_is_blocked() {
     local name="${1%.app}"
-    local existing
-    while IFS= read -r existing; do
-        [[ -n "$existing" ]] || continue
-        _icase_equal "$existing" "$name" && return 0
-    done < <(_app_list)
-    return 1
+    local blocked_list="${2-}"
+
+    if [[ -z "$blocked_list" ]]; then
+        blocked_list=$(_app_list)
+    fi
+    [[ -n "$blocked_list" ]] || return 1
+    printf '%s\n' "$blocked_list" | grep -Fixq -- "$name"
 }
 
 # Run blockdown remove after TUI friction gate. Prints user feedback.

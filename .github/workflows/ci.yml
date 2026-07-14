@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n syntax check
+        run: |
+          set -euo pipefail
+          files=(
+            blockdown
+            setup
+            scripts/*.sh
+            lib/*.sh
+            files/*.sh
+            files/mdsyncd
+            files/killappsd
+            files/statsd
+            files/blockdown
+            files/pin
+            files/ban
+          )
+          for f in "${files[@]}"; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done

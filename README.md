@@ -1,8 +1,15 @@
 # Blockdown
 
-Screen Time for Mac, but it actually works.
+[![CI](https://github.com/deva-ships/blockdown/actions/workflows/ci.yml/badge.svg)](https://github.com/deva-ships/blockdown/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-You decide what your Mac will and won't open. Blockdown holds the line. Block websites, apps, and whole categories, everywhere at once: every browser, every app, even apps you haven't installed yet. Turning a block off is deliberate, never instant. You wait out a timer, or you use a key only you hold. Free and open source.
+Blockdown enforces the limits you set.
+
+Block websites, apps, and entire categories across your whole Mac. The rules apply everywhere: every browser, every app, even apps you install later. Turning a block off is always deliberate. Wait out a timer, or unlock it with a key only you hold.
+
+Free and open source.
+
+![Blockdown main menu](docs/images/tui-main.png)
 
 ## Install
 

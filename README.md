@@ -7,8 +7,6 @@ Blockdown enforces the limits you set.
 
 Block websites, apps, and entire categories across your whole Mac. The rules apply everywhere: every browser, every app, even apps you install later. Turning a block off is always deliberate. Wait out a timer, or unlock it with a key only you hold.
 
-Free and open source.
-
 ![Blockdown main menu](docs/images/tui-main.png)
 
 ## Install

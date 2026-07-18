@@ -91,7 +91,7 @@ On Max, CLI removal is a fixed two-step, 24-hours-apart process. Full reference:
 
 ## Honest limits
 
-- Personal project, provided as-is with no warranty (see [LICENSE](LICENSE)). It changes real system settings on your Mac (network filtering, the hosts file, background helpers). Read what it does before running it; try a spare Mac or a virtual machine first if unsure.
+- Personal project, provided as-is with no warranty (see [LICENSE](LICENSE)). It changes real system settings on your Mac (network filtering, the hosts file, background helpers). 
 - Max resists an admin by cost, not magic. Someone with admin access who studies the code can eventually take it apart; the design makes that a deliberate, multi-hour project instead of a toggle. For a user without admin rights (a kid's account), it is effectively a wall.
 - Some background helpers use Apple-style names on purpose, so they don't advertise themselves to the person being blocked. This is documented behavior, not concealment from you.
 

@@ -133,24 +133,24 @@ filter). Menu items:
 - **Block apps** (Layer 2): block a downloaded app (scan of `/Applications`,
   `~/Applications`, `~/Downloads`), block any app by name, unblock, list; "Pending
   removals" in cooldown mode.
-- **Set up web filter** (Layer 3): choose one of five filters, fix bypasses
+- **Set up web filter** (Layer 3): choose a filter (including NextDNS Custom), fix bypasses
   (VPN extensions / Layer 4, unsupported browsers / Layer 2), change filter,
   remove filtering.
 - **Settings**: set unlock method; update key (key mode) or cooldown
   (cooldown mode, increase-only); remove browser policies (when applied); reset
   dry-run state (dry-run only); uninstall.
 
-### DNS filter catalog (5 filters)
+### DNS filter catalog
 
-1. **AdGuard Standard** — ads/trackers/phishing; content open.
-2. **Control D Social** — blocks major social media.
-3. **Mullvad Extended** — social media + embedded tracking scripts.
-4. **CleanBrowsing Adult** — adult content + SafeSearch; Reddit/X still work.
-5. **CleanBrowsing Family** — adult content, Reddit, and bypass methods (strictest).
+1. **Control D Social** — blocks major social media.
+2. **Mullvad Extended** — social media + embedded tracking scripts.
+3. **CleanBrowsing Adult** — adult content + SafeSearch; Reddit/X still work.
+4. **CleanBrowsing Family** — adult content, Reddit, and bypass methods (strictest).
+5. **NextDNS Custom** — your own web filter from nextdns.io (prompts for ID).
 
 The Layer 3 installer (`scripts/install-dns.sh`) also accepts a few additional
-upstreams via `--filter` (Security, Cloudflare Families, NextDNS) for advanced
-direct-CLI use, but the five above are the supported, TUI-exposed set.
+upstreams via `--filter` (Security, Cloudflare Families, legacy AdGuard Standard)
+for advanced direct-CLI use, but the five above are the supported, TUI-exposed set.
 
 ## 7. Removal friction model
 
@@ -262,8 +262,8 @@ These map 1:1 to the task exit conditions and define "working" for Phase 1.
 
 ### E. Web filter / DNS (Layer 3)
 - Workflow: no filter → choose filter → fix bypasses.
-- Filters: AdGuard Standard, Control D Social, Mullvad Extended, CleanBrowsing
-  Adult, CleanBrowsing Family.
+- Filters: Control D Social, Mullvad Extended, CleanBrowsing Adult,
+  CleanBrowsing Family, NextDNS Custom.
 - Fix bypasses, change filter, remove filtering work; dry-run simulates only.
 
 ### F. Settings & lifecycle

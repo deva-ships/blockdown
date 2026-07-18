@@ -8,10 +8,12 @@ screen_settings() {
         echo ""
         # Unlock method is edition-independent: Blockdown and Max both gate TUI
         # removals. Edition only controls system lock-in (schg / self-heal).
+        # Key/cooldown are sticky — change only via uninstall + reinstall.
+        # "Set unlock method" is only for none (no restrictions).
         local menu_items=()
-        menu_items+=("Set unlock method")
-        # Only the option relevant to the chosen unlock method.
-        if [[ "$(unlock_method)" == "key" ]]; then
+        if [[ "$(unlock_method)" == "none" ]]; then
+            menu_items+=("Set unlock method")
+        elif [[ "$(unlock_method)" == "key" ]]; then
             menu_items+=("Update unlock key")
         elif [[ "$(unlock_method)" == "cooldown" ]]; then
             menu_items+=("Update cooldown timer")
@@ -48,17 +50,7 @@ screen_settings() {
 }
 
 _settings_set_unlock_method() {
-    if [[ "$(unlock_method)" == "key" ]]; then
-        clear
-        echo "  Enter your unlock key to change how blocks are removed."
-        echo ""
-        if ! verify_unlock_key; then
-            ui_error "Incorrect key. Unlock method unchanged."
-            ui_pause
-            return
-        fi
-    fi
-
+    # Only reachable when unlock_method is none (menu gated above).
     screen_unlock_method settings
 }
 

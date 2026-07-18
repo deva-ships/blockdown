@@ -126,20 +126,16 @@ _dns_has_category_filter() {
 # ── Filter catalog ────────────────────────────────────────────────────────────
 _dns_filter_summary() {
     case "$1" in
-        "AdGuard Standard")     echo "Blocks ads, trackers, and phishing. Everything else stays open." ;;
         "Control D Social")     echo "Blocks TikTok, Instagram, Facebook, X, Reddit, Snapchat, Discord." ;;
         "Mullvad Extended")     echo "Blocks social media and tracking scripts embedded in normal sites." ;;
         "CleanBrowsing Adult")  echo "Blocks adult content and enables SafeSearch. Reddit and X still work." ;;
         "CleanBrowsing Family") echo "Blocks adult content, Reddit, and ways to bypass the filter." ;;
+        "NextDNS Custom")       echo "Uses your own web filter from nextdns.io. Set it up there first." ;;
     esac
 }
 
 _dns_filter_detail() {
     case "$1" in
-        "AdGuard Standard")
-            echo "  Blocks ads, trackers, and phishing sites. Everything else"
-            echo "  stays fully open. No content restrictions."
-            ;;
         "Control D Social")
             echo "  Blocks the social media apps most likely to waste your time:"
             echo "  TikTok, Instagram, Facebook, X, Reddit, Snapchat, and Discord."
@@ -158,7 +154,33 @@ _dns_filter_detail() {
             echo "  The strictest option. Blocks adult content, Reddit, and known"
             echo "  ways to get around filters (web proxies, VPN sites, Tor)."
             ;;
+        "NextDNS Custom")
+            echo "  A custom web filter you build at nextdns.io."
+            echo "  Set up what to block there, then connect it here."
+            ;;
     esac
+}
+
+# Prompt for a NextDNS ID. Echoes the ID on stdout; UI goes to stderr so
+# callers can capture with nextdns_id=$(_dns_prompt_nextdns_id).
+_dns_prompt_nextdns_id() {
+    local id
+    clear >&2
+    ui_heading "NextDNS Custom" >&2
+    echo "  Your ID is the short code in your NextDNS link." >&2
+    echo "  For my.nextdns.io/abc123/setup, enter abc123." >&2
+    echo "" >&2
+    id=$(ui_input "Enter your NextDNS ID") || return 1
+    id=$(echo "$id" | tr -d '[:space:]')
+    if [[ -z "$id" ]]; then
+        return 1
+    fi
+    if [[ ! "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        ui_error "That doesn't look like a NextDNS ID."
+        ui_pause "Press return to go back. ↵"
+        return 1
+    fi
+    echo "$id"
 }
 
 _dns_sync_filter_from_backend() {
@@ -222,16 +244,20 @@ _dns_first_time_loop() {
 }
 
 _dns_pick_and_install_filter() {
-    local filter
+    local filter nextdns_id=""
     filter=$(_dns_choose_filter "Choose a web filter" "Go back without setting a filter.") || return 0
     [[ -z "$filter" ]] && return 0
+
+    if [[ "$filter" == "NextDNS Custom" ]]; then
+        nextdns_id=$(_dns_prompt_nextdns_id) || return 0
+    fi
 
     if ! _dns_confirm_filter "$filter" "Set up this filter?"; then
         return
     fi
 
     echo ""
-    if ! _dns_apply_filter "$filter"; then
+    if ! _dns_apply_filter "$filter" "$nextdns_id"; then
         ui_error "Web filter was not set up."
         ui_pause "Press return to go back. ↵"
         return
@@ -246,11 +272,11 @@ _dns_pick_and_install_filter() {
 _dns_choose_filter() {
     local prompt="$1" cancel_desc="$2" sel
     sel=$(ui_choose_desc "$prompt" \
-        "AdGuard Standard"     "$(_dns_filter_summary 'AdGuard Standard')" \
         "Control D Social"     "$(_dns_filter_summary 'Control D Social')" \
         "Mullvad Extended"     "$(_dns_filter_summary 'Mullvad Extended')" \
         "CleanBrowsing Adult"  "$(_dns_filter_summary 'CleanBrowsing Adult')" \
         "CleanBrowsing Family" "$(_dns_filter_summary 'CleanBrowsing Family')" \
+        "NextDNS Custom"       "$(_dns_filter_summary 'NextDNS Custom')" \
         "← Cancel"             "$cancel_desc") || return 1
     [[ "$sel" == "← Cancel" || -z "$sel" ]] && return 1
     echo "$sel"
@@ -267,14 +293,23 @@ _dns_confirm_filter() {
 
 _dns_apply_filter() {
     local filter="$1"
+    local nextdns_id="${2:-}"
+    local -a install_args=(--filter "$filter")
+
+    if [[ "$filter" == "NextDNS Custom" ]]; then
+        if [[ -z "$nextdns_id" ]]; then
+            nextdns_id=$(_dns_prompt_nextdns_id) || return 1
+        fi
+        install_args+=(--nextdns-id "$nextdns_id")
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         config_set DNS_FILTER "$filter"
-        run_cmd sudo "${BLOCKDOWN_SCRIPT_DIR}/install-dns.sh" --filter "$filter"
+        run_cmd sudo "${BLOCKDOWN_SCRIPT_DIR}/install-dns.sh" "${install_args[@]}"
         return 0
     fi
 
-    if ! run_cmd sudo "${BLOCKDOWN_SCRIPT_DIR}/install-dns.sh" --filter "$filter"; then
+    if ! run_cmd sudo "${BLOCKDOWN_SCRIPT_DIR}/install-dns.sh" "${install_args[@]}"; then
         return 1
     fi
 
@@ -339,11 +374,13 @@ _dns_change_filter() {
         return
     fi
 
-    local filter
+    local filter nextdns_id=""
     filter=$(_dns_choose_filter "Choose a web filter" "Keep the current filter.") || return 0
     [[ -z "$filter" ]] && return 0
 
-    if [[ "$filter" == "$(_dns_filter)" ]]; then
+    if [[ "$filter" == "NextDNS Custom" ]]; then
+        nextdns_id=$(_dns_prompt_nextdns_id) || return 0
+    elif [[ "$filter" == "$(_dns_filter)" ]]; then
         ui_info "That filter is already active."
         ui_pause
         return
@@ -354,7 +391,7 @@ _dns_change_filter() {
     fi
 
     echo ""
-    if ! _dns_apply_filter "$filter"; then
+    if ! _dns_apply_filter "$filter" "$nextdns_id"; then
         ui_error "Web filter was not changed."
         ui_pause
         return

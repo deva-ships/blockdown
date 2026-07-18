@@ -75,7 +75,7 @@ sudo ./scripts/install-dns.sh --filter "CleanBrowsing Adult"
 sudo ./scripts/install-dns.sh --remove
 ```
 
-The five supported filters are AdGuard Standard, Control D Social, Mullvad Extended, CleanBrowsing Adult, and CleanBrowsing Family. Changing or removing the filter from the TUI goes through your unlock method.
+The supported filters are Control D Social, Mullvad Extended, CleanBrowsing Adult, CleanBrowsing Family, and NextDNS Custom. Changing or removing the filter from the TUI goes through your unlock method.
 
 ## TUI
 

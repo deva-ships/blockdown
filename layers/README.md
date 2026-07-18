@@ -45,7 +45,7 @@ Layer 3 is independent and can be installed first if you prefer; Layers 1 and 2 
 
 ## Post-install sanity check
 
-**Web filter** (adult-content filters only; for AdGuard/Control D/Mullvad test a domain that filter blocks):
+**Web filter** (adult-content filters only; for Control D/Mullvad/NextDNS test a domain that filter blocks):
 
 ```bash
 dscacheutil -q host -a name pornhub.com

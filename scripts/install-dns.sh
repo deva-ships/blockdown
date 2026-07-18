@@ -134,12 +134,17 @@ log "Layer 3 web filter install started."
 
 # ── Argument parsing ────────────────────────────────────────────────────────
 FILTER_ARG=""
+NEXTDNS_ID_ARG=""
 IS_REMOVE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --filter)
             FILTER_ARG="$2"
+            shift 2
+            ;;
+        --nextdns-id)
+            NEXTDNS_ID_ARG="$2"
             shift 2
             ;;
         --remove)
@@ -178,34 +183,34 @@ if [[ -n "$FILTER_ARG" ]]; then
         *)                       FILTER_CHOICE=1 ;;
     esac
 else
-    # Interactive menu mirrors the five filters offered by the TUI
-    # ("Set up web filter"). Other upstreams remain reachable via --filter.
+    # Interactive menu mirrors the TUI ("Set up web filter").
+    # Other upstreams remain reachable via --filter.
     echo "Select a web filter:"
     echo ""
-    echo "  1) AdGuard Standard"
-    echo "     Blocks ads, trackers, and phishing. Everything else stays open."
-    echo ""
-    echo "  2) Control D Social"
+    echo "  1) Control D Social"
     echo "     Blocks TikTok, Instagram, Facebook, X, Reddit, Snapchat, Discord."
     echo ""
-    echo "  3) Mullvad Extended"
+    echo "  2) Mullvad Extended"
     echo "     Blocks social media plus tracking scripts embedded in normal sites."
     echo ""
-    echo "  4) CleanBrowsing Adult   (default)"
+    echo "  3) CleanBrowsing Adult   (default)"
     echo "     Blocks adult content and enables SafeSearch. Reddit and X still work."
     echo ""
-    echo "  5) CleanBrowsing Family  (strictest)"
+    echo "  4) CleanBrowsing Family  (strictest)"
     echo "     Blocks adult content, Reddit, and known filter-bypass methods."
     echo ""
-    read -rp "Enter choice [1-5, default 4]: " MENU_CHOICE
+    echo "  5) NextDNS Custom"
+    echo "     Uses your own web filter from nextdns.io. Set it up there first."
+    echo ""
+    read -rp "Enter choice [1-5, default 3]: " MENU_CHOICE
     echo ""
     # Translate the menu position into the internal filter-choice numbers used below.
-    case "${MENU_CHOICE:-4}" in
-        1) FILTER_CHOICE=6 ;;   # AdGuard Standard
-        2) FILTER_CHOICE=7 ;;   # Control D Social
-        3) FILTER_CHOICE=8 ;;   # Mullvad Extended
-        4) FILTER_CHOICE=1 ;;   # CleanBrowsing Adult
-        5) FILTER_CHOICE=2 ;;   # CleanBrowsing Family
+    case "${MENU_CHOICE:-3}" in
+        1) FILTER_CHOICE=7 ;;   # Control D Social
+        2) FILTER_CHOICE=8 ;;   # Mullvad Extended
+        3) FILTER_CHOICE=1 ;;   # CleanBrowsing Adult
+        4) FILTER_CHOICE=2 ;;   # CleanBrowsing Family
+        5) FILTER_CHOICE=5 ;;   # NextDNS Custom
         *) FILTER_CHOICE=1 ;;
     esac
 fi
@@ -238,9 +243,18 @@ case "${FILTER_CHOICE:-1}" in
         CB_PROFILE_ID="com.cloudflare.dns.families"
         ;;
     5)
-        read -rp "Enter your NextDNS Configuration ID (e.g., abcdef): " NEXTDNS_ID
+        if [[ -n "$NEXTDNS_ID_ARG" ]]; then
+            NEXTDNS_ID="$NEXTDNS_ID_ARG"
+        else
+            read -rp "Enter your NextDNS Configuration ID (e.g., abcdef): " NEXTDNS_ID
+        fi
+        NEXTDNS_ID=$(echo "$NEXTDNS_ID" | tr -d '[:space:]')
         if [[ -z "$NEXTDNS_ID" ]]; then
             echo "Error: NextDNS ID is required." >&2
+            exit 1
+        fi
+        if [[ ! "$NEXTDNS_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "Error: NextDNS ID must be letters, numbers, hyphens, or underscores." >&2
             exit 1
         fi
         FILTER_NAME="NextDNS Custom"

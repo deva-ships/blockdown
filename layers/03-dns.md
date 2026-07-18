@@ -2,15 +2,15 @@
 
 **Goal:** Every DNS query on this Mac, from any app, with or without a VPN, is routed through a chosen filtered DoH resolver. Depending on the filter, blocked sites return NXDOMAIN or a sinkhole address.
 
-**Filter catalog (5 options, matching the TUI "Set up web filter"):**
+**Filter catalog (matching the TUI "Set up web filter"):**
 
-- **AdGuard Standard** — blocks ads, trackers, and phishing; content stays open.
 - **Control D Social** — blocks major social media (TikTok, Instagram, Facebook, X, Reddit, Snapchat, Discord).
 - **Mullvad Extended** — blocks social media plus tracking scripts embedded in normal sites.
 - **CleanBrowsing Adult** — blocks adult content and enables SafeSearch; Reddit and X still work.
 - **CleanBrowsing Family** — blocks adult content, Reddit, and known filter-bypass methods (strictest).
+- **NextDNS Custom** — your own web filter from nextdns.io. The TUI prompts for the ID (CLI: `--filter "NextDNS Custom" --nextdns-id <id>`).
 
-The installer also accepts a few additional upstreams via `--filter` (Security, Cloudflare Families, NextDNS) for advanced use, but the five above are the supported, TUI-exposed set.
+The installer also accepts a few additional upstreams via `--filter` (Security, Cloudflare Families, and legacy AdGuard Standard) for advanced use.
 
 **Why it exists here:** Broadest category block. Fires before TCP connect. Independent of browser / VPN / app. Sits above the VPN stack in macOS's network priority (Filters & Proxies is higher than VPN). Layers 1–2 are precise (named domains and apps); Layer 3 is the category-wide backstop.
 
@@ -43,7 +43,7 @@ sudo ./scripts/install-dns.sh
 
 The installer will:
 
-1. Ask you to select one of the five filters (default: CleanBrowsing Adult).
+1. Ask you to select a filter (interactive menu defaults to CleanBrowsing Adult; TUI includes NextDNS Custom).
 2. Install the PF anchor at `/etc/pf.anchors/dns-filter`.
 3. Back up `/etc/pf.conf` and safely inject the required anchor lines.
 4. Install and load the PF LaunchDaemon. Activate PF immediately (no reboot required).
@@ -71,7 +71,7 @@ The installer runs these checks automatically. You can re-run them manually at a
 dig +short pornhub.com
 ```
 
-Expected: empty output (or a timeout error if the PF block fires before the resolver responds). Note: this specific check only applies to filters that block adult content (CleanBrowsing Adult/Family). For AdGuard Standard, Control D Social, or Mullvad Extended, verify with a domain that filter actually blocks instead.
+Expected: empty output (or a timeout error if the PF block fires before the resolver responds). Note: this specific check only applies to filters that block adult content (CleanBrowsing Adult/Family). For Control D Social, Mullvad Extended, or NextDNS Custom, verify with a domain that filter actually blocks instead.
 
 ```bash
 # Profile installed

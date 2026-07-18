@@ -50,7 +50,7 @@ Both restore network settings. If setup fails partway, see [docs/OVERVIEW.md](do
 
 - **Websites.** Block a site everywhere at once. `reddit.com` stops loading in Safari, Chrome, private windows, and inside other apps.
 - **Apps.** A blocked app closes within about ten seconds of opening. Renaming it or downloading a fresh copy doesn't bring it back.
-- **Web categories** (optional). One filter blocks an entire category for the Mac: ads and trackers, social media, or adult content. You pick one of five filters during setup.
+- **Web categories** (optional). One filter blocks an entire category for the Mac: social media, adult content, or your own NextDNS config. You pick a filter during setup.
 
 Blockdown also closes the usual workarounds. A **Fix bypasses** step in the menu hardens Chrome, Edge, and similar browsers so they cannot skip the filter, and can block Firefox, Opera, and Tor Browser as apps if you want. Your own VPN keeps working.
 
